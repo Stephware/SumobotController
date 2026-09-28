@@ -47,7 +47,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   static const String _password = '12345678';
   static const String _baseUrl = 'http://192.168.4.1';
 
-  // These mirror the current Arduino firmware.
   static const int _opponentDetectionDistanceMm = 700;
   static const int _edgeThreshold = 1800;
   static const bool _edgeIsHigh = true;
@@ -126,7 +125,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             const Duration(seconds: 3),
           );
       final body = await utf8.decoder.bind(response).join();
-
       final success = response.statusCode == HttpStatus.ok;
 
       if (!mounted) return success ? body : null;
@@ -214,8 +212,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     _statusRequestInFlight = true;
 
     try {
-      // Do not mark the ESP32 offline from one missed status request because
-      // the current autonomous firmware contains short blocking motor delays.
       final body = await _get('/status', affectConnection: false);
       if (body == null || !mounted) return;
 
@@ -245,7 +241,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         lastStatusUpdate = DateTime.now();
       });
     } catch (_) {
-      // Keep the last good sensor values if one response is incomplete.
+      // Keep the last valid readings if one status response is incomplete.
     } finally {
       _statusRequestInFlight = false;
     }
@@ -338,6 +334,27 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     await _fetchStatus();
   }
 
+  // The chassis orientation is reversed physically:
+  // - Joystick FORWARD must use the Arduino reverse route (/b)
+  // - Joystick REVERSE must use the Arduino forward route (/f)
+  // - Joystick LEFT must use the Arduino right route (/r)
+  // - Joystick RIGHT must use the Arduino left route (/l)
+  String? _driveEndpoint(DriveDirection direction) {
+    return switch (direction) {
+      DriveDirection.forward => '/b',
+      DriveDirection.reverse => '/f',
+      DriveDirection.stopped => null,
+    };
+  }
+
+  String? _steeringEndpoint(SteeringDirection direction) {
+    return switch (direction) {
+      SteeringDirection.left => '/r',
+      SteeringDirection.right => '/l',
+      SteeringDirection.center => null,
+    };
+  }
+
   void _updateJoystick(Offset localPosition) {
     if (!isConnected || mode != ControlMode.manual) return;
 
@@ -351,6 +368,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       offset = offset * (maxTravel / distance);
     }
 
+    // Keep the UI intuitive: dragging up still means FORWARD to the user.
+    // Only the endpoint sent to the reversed chassis is inverted.
     final newDrive = offset.dy < -_joystickDeadZone
         ? DriveDirection.forward
         : offset.dy > _joystickDeadZone
@@ -412,39 +431,35 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     final steeringWasReleased = oldSteering != SteeringDirection.center &&
         newSteering == SteeringDirection.center;
 
-    // The current firmware still has one shared stop route (/s). If one
-    // joystick axis goes neutral, stop both then restore the remaining axis.
+    // The firmware has one shared stop endpoint. If either axis returns to
+    // neutral, stop both first and restore the remaining active axis.
     if (driveWasReleased || steeringWasReleased) {
       final stopped = await _queueCommand('/s');
       if (!stopped || !mounted) return;
 
-      if (newDrive == DriveDirection.forward) {
-        await _queueCommand('/f');
-      } else if (newDrive == DriveDirection.reverse) {
-        await _queueCommand('/b');
+      final driveEndpoint = _driveEndpoint(newDrive);
+      if (driveEndpoint != null) {
+        await _queueCommand(driveEndpoint);
       }
 
-      if (newSteering == SteeringDirection.left) {
-        await _queueCommand('/l');
-      } else if (newSteering == SteeringDirection.right) {
-        await _queueCommand('/r');
+      final steeringEndpoint = _steeringEndpoint(newSteering);
+      if (steeringEndpoint != null) {
+        await _queueCommand(steeringEndpoint);
       }
       return;
     }
 
     if (newDrive != oldDrive) {
-      if (newDrive == DriveDirection.forward) {
-        await _queueCommand('/f');
-      } else if (newDrive == DriveDirection.reverse) {
-        await _queueCommand('/b');
+      final endpoint = _driveEndpoint(newDrive);
+      if (endpoint != null) {
+        await _queueCommand(endpoint);
       }
     }
 
     if (newSteering != oldSteering) {
-      if (newSteering == SteeringDirection.left) {
-        await _queueCommand('/l');
-      } else if (newSteering == SteeringDirection.right) {
-        await _queueCommand('/r');
+      final endpoint = _steeringEndpoint(newSteering);
+      if (endpoint != null) {
+        await _queueCommand(endpoint);
       }
     }
   }
@@ -658,8 +673,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  // Manual mode intentionally has no ScrollView. This keeps the page fixed
-  // while the joystick is dragged.
   Widget _buildFixedManualScreen() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 14),
@@ -692,7 +705,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   const SizedBox(height: 4),
                   Text(
                     isConnected
-                        ? 'Forward points toward the spare-tire attack side'
+                        ? 'Controls are mapped to the reversed chassis'
                         : 'Connect to ESP32-ROBOT to enable control',
                     style: const TextStyle(
                       color: Colors.white38,
@@ -1194,7 +1207,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
               borderRadius: BorderRadius.circular(12),
             ),
             child: const Text(
-              'Center sensor has priority: once CENTER detects the opponent, the robot straightens and attacks. LEFT/RIGHT are used to align first.',
+              'Center sensor has priority: once CENTER detects the opponent, the robot straightens and attacks. LEFT/RIGHT align the chassis first.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: Colors.white54,
@@ -1287,25 +1300,17 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           const SizedBox(height: 18),
           Row(
             children: [
-              Expanded(
-                child: _edgeTile('FRONT LEFT', edgeFrontLeft),
-              ),
+              Expanded(child: _edgeTile('FRONT LEFT', edgeFrontLeft)),
               const SizedBox(width: 8),
-              Expanded(
-                child: _edgeTile('FRONT RIGHT', edgeFrontRight),
-              ),
+              Expanded(child: _edgeTile('FRONT RIGHT', edgeFrontRight)),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(
-                child: _edgeTile('REAR LEFT', edgeRearLeft),
-              ),
+              Expanded(child: _edgeTile('REAR LEFT', edgeRearLeft)),
               const SizedBox(width: 8),
-              Expanded(
-                child: _edgeTile('REAR RIGHT', edgeRearRight),
-              ),
+              Expanded(child: _edgeTile('REAR RIGHT', edgeRearRight)),
             ],
           ),
           const SizedBox(height: 12),
@@ -1389,7 +1394,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           _sectionHeader(
             icon: Icons.account_tree_rounded,
             title: 'Autonomous Priority',
-            subtitle: 'Matches the new ESP32 state logic',
+            subtitle: 'Matches the ESP32 state logic',
           ),
           const SizedBox(height: 16),
           _logicRow('1', 'EDGE', 'Escape immediately', Colors.redAccent),
@@ -1406,7 +1411,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             ),
           ),
           const SizedBox(height: 8),
-          _endpointRow('/f  /b  /l  /r  /s', 'Manual control'),
+          _endpointRow('/f  /b  /l  /r  /s', 'Manual motor routes'),
           _endpointRow('/auto/start', 'Start autonomous mode'),
           _endpointRow('/auto/stop', 'Stop autonomous mode'),
           _endpointRow('/status', 'Mode, state, ToF and edge readings'),
