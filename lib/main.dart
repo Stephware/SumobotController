@@ -96,6 +96,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         connectionMessage = success
             ? 'Connected to ESP32 at 192.168.4.1'
             : 'ESP32 responded with HTTP ${response.statusCode}.';
+
         if (success && updateCommand) {
           lastCommand = path;
         }
@@ -155,71 +156,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           ),
         ),
       );
-    }
-  }
-
-  void _pressDrive(DriveDirection direction) {
-    if (!isConnected || mode != ControlMode.manual) return;
-
-    setState(() {
-      driveDirection = direction;
-    });
-
-    final endpoint =
-        direction == DriveDirection.forward ? '/f' : '/b';
-    unawaited(_queueCommand(endpoint));
-  }
-
-  void _releaseDrive() {
-    if (mode != ControlMode.manual) return;
-
-    setState(() {
-      driveDirection = DriveDirection.stopped;
-    });
-
-    if (isConnected) {
-      unawaited(_stopThenRestoreActiveMotor());
-    }
-  }
-
-  void _pressSteering(SteeringDirection direction) {
-    if (!isConnected || mode != ControlMode.manual) return;
-
-    setState(() {
-      steeringDirection = direction;
-    });
-
-    final endpoint =
-        direction == SteeringDirection.left ? '/l' : '/r';
-    unawaited(_queueCommand(endpoint));
-  }
-
-  void _releaseSteering() {
-    if (mode != ControlMode.manual) return;
-
-    setState(() {
-      steeringDirection = SteeringDirection.center;
-    });
-
-    if (isConnected) {
-      unawaited(_stopThenRestoreActiveMotor());
-    }
-  }
-
-  Future<void> _stopThenRestoreActiveMotor() async {
-    final stopped = await _queueCommand('/s');
-    if (!stopped || !mounted) return;
-
-    if (driveDirection == DriveDirection.forward) {
-      await _queueCommand('/f');
-    } else if (driveDirection == DriveDirection.reverse) {
-      await _queueCommand('/b');
-    }
-
-    if (steeringDirection == SteeringDirection.left) {
-      await _queueCommand('/l');
-    } else if (steeringDirection == SteeringDirection.right) {
-      await _queueCommand('/r');
     }
   }
 
@@ -293,8 +229,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   void _releaseJoystick() {
     if (mode != ControlMode.manual) return;
 
-    final oldDrive = driveDirection;
-    final oldSteering = steeringDirection;
+    final wasMoving = driveDirection != DriveDirection.stopped ||
+        steeringDirection != SteeringDirection.center;
 
     setState(() {
       _joystickOffset = Offset.zero;
@@ -302,9 +238,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       steeringDirection = SteeringDirection.center;
     });
 
-    if (isConnected &&
-        (oldDrive != DriveDirection.stopped ||
-            oldSteering != SteeringDirection.center)) {
+    if (isConnected && wasMoving) {
       unawaited(_queueCommand('/s'));
     }
   }
@@ -320,8 +254,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     final steeringWasReleased = oldSteering != SteeringDirection.center &&
         newSteering == SteeringDirection.center;
 
-    // Current firmware has only /s, which stops both motors. If either axis
-    // returns to neutral, stop both and then restore the other active axis.
+    // Current ESP32 firmware only has /s, so if either joystick axis returns
+    // to neutral we stop both motors, then restore the other active axis.
     if (driveWasReleased || steeringWasReleased) {
       final stopped = await _queueCommand('/s');
       if (!stopped || !mounted) return;
@@ -406,21 +340,9 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             _buildHeader(),
             _buildModeSelector(),
             Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                child: Column(
-                  children: [
-                    _buildConnectionCard(),
-                    const SizedBox(height: 16),
-                    if (mode == ControlMode.manual)
-                      _buildManualController()
-                    else
-                      _buildAutomaticPlaceholder(),
-                    const SizedBox(height: 16),
-                    _buildFirmwareStatus(),
-                  ],
-                ),
-              ),
+              child: mode == ControlMode.manual
+                  ? _buildFixedManualScreen()
+                  : _buildScrollableAutomaticScreen(),
             ),
           ],
         ),
@@ -430,23 +352,23 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
   Widget _buildHeader() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
+      padding: const EdgeInsets.fromLTRB(18, 14, 18, 8),
       child: Row(
         children: [
           Container(
-            height: 48,
-            width: 48,
+            height: 44,
+            width: 44,
             decoration: BoxDecoration(
               color: const Color(0xFF1E88E5).withValues(alpha: 0.15),
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(13),
             ),
             child: const Icon(
               Icons.smart_toy_rounded,
               color: Color(0xFF42A5F5),
-              size: 29,
+              size: 27,
             ),
           ),
-          const SizedBox(width: 14),
+          const SizedBox(width: 12),
           const Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -454,17 +376,16 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 Text(
                   'SUMOBOT',
                   style: TextStyle(
-                    fontSize: 22,
+                    fontSize: 20,
                     fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
+                    letterSpacing: 1.1,
                   ),
                 ),
-                SizedBox(height: 2),
                 Text(
                   'ESP32 Robot Controller',
                   style: TextStyle(
                     color: Colors.white54,
-                    fontSize: 13,
+                    fontSize: 11,
                   ),
                 ),
               ],
@@ -478,27 +399,27 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
   Widget _connectionBadge() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
       decoration: BoxDecoration(
         color: (isConnected ? Colors.green : Colors.red)
             .withValues(alpha: 0.13),
-        borderRadius: BorderRadius.circular(30),
+        borderRadius: BorderRadius.circular(24),
       ),
       child: Row(
         children: [
           Container(
-            width: 8,
-            height: 8,
+            width: 7,
+            height: 7,
             decoration: BoxDecoration(
               color: isConnected ? Colors.greenAccent : Colors.redAccent,
               shape: BoxShape.circle,
             ),
           ),
-          const SizedBox(width: 7),
+          const SizedBox(width: 6),
           Text(
             isConnected ? 'Connected' : 'Offline',
             style: TextStyle(
-              fontSize: 12,
+              fontSize: 11,
               fontWeight: FontWeight.w600,
               color: isConnected ? Colors.greenAccent : Colors.redAccent,
             ),
@@ -510,12 +431,12 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
   Widget _buildModeSelector() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+      padding: const EdgeInsets.fromLTRB(16, 2, 16, 8),
       child: Container(
         padding: const EdgeInsets.all(4),
         decoration: BoxDecoration(
           color: const Color(0xFF15181D),
-          borderRadius: BorderRadius.circular(15),
+          borderRadius: BorderRadius.circular(14),
         ),
         child: Row(
           children: [
@@ -549,32 +470,363 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   }) {
     return Material(
       color: selected ? const Color(0xFF1565C0) : Colors.transparent,
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: BorderRadius.circular(11),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(11),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 12),
+          padding: const EdgeInsets.symmetric(vertical: 10),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(
                 icon,
-                size: 19,
+                size: 18,
                 color: selected ? Colors.white : Colors.white54,
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 7),
               Text(
                 title,
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
-                  fontSize: 13,
+                  fontSize: 12,
                   color: selected ? Colors.white : Colors.white54,
                 ),
               ),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  // Manual mode deliberately contains no ScrollView so dragging the joystick
+  // cannot move the page while the robot is being controlled.
+  Widget _buildFixedManualScreen() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 14),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return Column(
+            children: [
+              _buildCompactConnectionBar(),
+              const SizedBox(height: 8),
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF14171C),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.055),
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 12),
+                      const Text(
+                        'MANUAL JOYSTICK',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                          letterSpacing: 1.3,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        isConnected
+                            ? 'Drag and hold to control the Sumobot'
+                            : 'Connect to ESP32-ROBOT to enable control',
+                        style: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 10.5,
+                        ),
+                      ),
+                      const Spacer(),
+                      _buildJoystick(),
+                      const Spacer(),
+                      _buildMovementStatus(),
+                      const SizedBox(height: 12),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFD32F2F),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed:
+                      isConnected ? () => unawaited(_stopAll()) : null,
+                  icon: const Icon(Icons.stop_circle_outlined),
+                  label: const Text(
+                    'STOP ALL',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildCompactConnectionBar() {
+    return Container(
+      height: 48,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF14171C),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.055),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.wifi_rounded,
+            size: 19,
+            color: isConnected ? Colors.greenAccent : Colors.white38,
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'ESP32-ROBOT • 192.168.4.1',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Text(
+                  isConnected ? 'Ready for commands' : 'Not connected',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: isConnected ? Colors.greenAccent : Colors.white38,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Test connection',
+            onPressed: isCheckingConnection
+                ? null
+                : () => _testConnection(showFeedback: true),
+            icon: isCheckingConnection
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh_rounded, size: 22),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMovementStatus() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF101318),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    movementText,
+                    style: TextStyle(
+                      color: isConnected
+                          ? Colors.lightBlueAccent
+                          : Colors.white38,
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.7,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Drive: $driveText • Steering: $steeringText',
+                    style: const TextStyle(
+                      color: Colors.white38,
+                      fontSize: 10,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Text(
+              lastCommand,
+              style: const TextStyle(
+                color: Colors.white30,
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildJoystick() {
+    return AnimatedOpacity(
+      duration: const Duration(milliseconds: 120),
+      opacity: isConnected ? 1 : 0.35,
+      child: SizedBox(
+        width: _joystickSize,
+        height: _joystickSize,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onPanDown: isConnected
+              ? (details) => _updateJoystick(details.localPosition)
+              : null,
+          onPanUpdate: isConnected
+              ? (details) => _updateJoystick(details.localPosition)
+              : null,
+          onPanEnd: isConnected ? (_) => _releaseJoystick() : null,
+          onPanCancel: isConnected ? _releaseJoystick : null,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: _joystickSize,
+                height: _joystickSize,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: const Color(0xFF101318),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.10),
+                    width: 2,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.25),
+                      blurRadius: 18,
+                      spreadRadius: 3,
+                    ),
+                  ],
+                ),
+              ),
+              const Positioned(
+                top: 14,
+                child: Icon(
+                  Icons.keyboard_arrow_up_rounded,
+                  color: Colors.white30,
+                  size: 32,
+                ),
+              ),
+              const Positioned(
+                bottom: 14,
+                child: Icon(
+                  Icons.keyboard_arrow_down_rounded,
+                  color: Colors.white30,
+                  size: 32,
+                ),
+              ),
+              const Positioned(
+                left: 14,
+                child: Icon(
+                  Icons.keyboard_arrow_left_rounded,
+                  color: Colors.white30,
+                  size: 32,
+                ),
+              ),
+              const Positioned(
+                right: 14,
+                child: Icon(
+                  Icons.keyboard_arrow_right_rounded,
+                  color: Colors.white30,
+                  size: 32,
+                ),
+              ),
+              Container(
+                width: 74,
+                height: 74,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.05),
+                  ),
+                ),
+              ),
+              Transform.translate(
+                offset: _joystickOffset,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 45),
+                  width: _joystickKnobSize,
+                  height: _joystickKnobSize,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Color(0xFF42A5F5), Color(0xFF1565C0)],
+                    ),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.18),
+                      width: 2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF1976D2)
+                            .withValues(alpha: 0.35),
+                        blurRadius: 18,
+                        spreadRadius: 2,
+                      ),
+                    ],
+                  ),
+                  child: const Icon(
+                    Icons.control_camera_rounded,
+                    color: Colors.white,
+                    size: 30,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildScrollableAutomaticScreen() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+      child: Column(
+        children: [
+          _buildConnectionCard(),
+          const SizedBox(height: 16),
+          _buildAutomaticPlaceholder(),
+          const SizedBox(height: 16),
+          _buildFirmwareStatus(),
+        ],
       ),
     );
   }
@@ -633,313 +885,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _buildManualController() {
-    return _card(
-      child: Column(
-        children: [
-          _sectionHeader(
-            icon: Icons.gamepad_rounded,
-            title: 'Manual Control',
-            subtitle: isConnected
-                ? 'Use the joystick or backup buttons below'
-                : 'Connect to the ESP32 before using the controls',
-          ),
-          const SizedBox(height: 24),
-          _buildJoystick(),
-          const SizedBox(height: 22),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF101318),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Column(
-              children: [
-                Text(
-                  movementText,
-                  style: TextStyle(
-                    color: isConnected ? Colors.lightBlueAccent : Colors.white38,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 0.8,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Drive: $driveText  •  Steering: $steeringText',
-                  style: const TextStyle(
-                    color: Colors.white54,
-                    fontSize: 11,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 26),
-          const Row(
-            children: [
-              Expanded(child: Divider()),
-              Padding(
-                padding: EdgeInsets.symmetric(horizontal: 12),
-                child: Text(
-                  'BACKUP BUTTONS',
-                  style: TextStyle(
-                    color: Colors.white38,
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
-                  ),
-                ),
-              ),
-              Expanded(child: Divider()),
-            ],
-          ),
-          const SizedBox(height: 20),
-          _holdButton(
-            icon: Icons.keyboard_arrow_up_rounded,
-            label: 'FORWARD',
-            active: driveDirection == DriveDirection.forward,
-            enabled: isConnected,
-            onPressed: () => _pressDrive(DriveDirection.forward),
-            onReleased: _releaseDrive,
-            width: 145,
-          ),
-          const SizedBox(height: 16),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              _holdButton(
-                icon: Icons.keyboard_arrow_left_rounded,
-                label: 'LEFT',
-                active: steeringDirection == SteeringDirection.left,
-                enabled: isConnected,
-                onPressed: () => _pressSteering(SteeringDirection.left),
-                onReleased: _releaseSteering,
-                width: 125,
-              ),
-              const SizedBox(width: 18),
-              _holdButton(
-                icon: Icons.keyboard_arrow_right_rounded,
-                label: 'RIGHT',
-                active: steeringDirection == SteeringDirection.right,
-                enabled: isConnected,
-                onPressed: () => _pressSteering(SteeringDirection.right),
-                onReleased: _releaseSteering,
-                width: 125,
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          _holdButton(
-            icon: Icons.keyboard_arrow_down_rounded,
-            label: 'REVERSE',
-            active: driveDirection == DriveDirection.reverse,
-            enabled: isConnected,
-            onPressed: () => _pressDrive(DriveDirection.reverse),
-            onReleased: _releaseDrive,
-            width: 145,
-          ),
-          const SizedBox(height: 26),
-          SizedBox(
-            width: double.infinity,
-            height: 54,
-            child: FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xFFD32F2F),
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-              onPressed: isConnected ? () => unawaited(_stopAll()) : null,
-              icon: const Icon(Icons.stop_circle_outlined),
-              label: const Text(
-                'STOP ALL',
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.8,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 18),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: const Color(0xFF101318),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Column(
-              children: [
-                _infoRow('Drive', driveText),
-                _infoRow('Steering', steeringText),
-                _infoRow('Last endpoint', lastCommand),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          const Text(
-            'Speed control is not shown because the current Arduino firmware does not use ENA/ENB PWM.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white38,
-              fontSize: 11,
-              height: 1.4,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildJoystick() {
-    return Column(
-      children: [
-        const Text(
-          'JOYSTICK',
-          style: TextStyle(
-            color: Colors.white70,
-            fontWeight: FontWeight.bold,
-            fontSize: 12,
-            letterSpacing: 1.4,
-          ),
-        ),
-        const SizedBox(height: 12),
-        AnimatedOpacity(
-          duration: const Duration(milliseconds: 120),
-          opacity: isConnected ? 1 : 0.35,
-          child: SizedBox(
-            width: _joystickSize,
-            height: _joystickSize,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onPanDown: isConnected
-                  ? (details) => _updateJoystick(details.localPosition)
-                  : null,
-              onPanUpdate: isConnected
-                  ? (details) => _updateJoystick(details.localPosition)
-                  : null,
-              onPanEnd: isConnected ? (_) => _releaseJoystick() : null,
-              onPanCancel: isConnected ? _releaseJoystick : null,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  Container(
-                    width: _joystickSize,
-                    height: _joystickSize,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: const Color(0xFF101318),
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.10),
-                        width: 2,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.25),
-                          blurRadius: 18,
-                          spreadRadius: 3,
-                        ),
-                      ],
-                    ),
-                  ),
-                  const Positioned(
-                    top: 14,
-                    child: Icon(
-                      Icons.keyboard_arrow_up_rounded,
-                      color: Colors.white30,
-                      size: 32,
-                    ),
-                  ),
-                  const Positioned(
-                    bottom: 14,
-                    child: Icon(
-                      Icons.keyboard_arrow_down_rounded,
-                      color: Colors.white30,
-                      size: 32,
-                    ),
-                  ),
-                  const Positioned(
-                    left: 14,
-                    child: Icon(
-                      Icons.keyboard_arrow_left_rounded,
-                      color: Colors.white30,
-                      size: 32,
-                    ),
-                  ),
-                  const Positioned(
-                    right: 14,
-                    child: Icon(
-                      Icons.keyboard_arrow_right_rounded,
-                      color: Colors.white30,
-                      size: 32,
-                    ),
-                  ),
-                  Container(
-                    width: 74,
-                    height: 74,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.05),
-                      ),
-                    ),
-                  ),
-                  Transform.translate(
-                    offset: _joystickOffset,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 45),
-                      width: _joystickKnobSize,
-                      height: _joystickKnobSize,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        gradient: const LinearGradient(
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                          colors: [Color(0xFF42A5F5), Color(0xFF1565C0)],
-                        ),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.18),
-                          width: 2,
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: const Color(0xFF1976D2)
-                                .withValues(alpha: 0.35),
-                            blurRadius: 18,
-                            spreadRadius: 2,
-                          ),
-                        ],
-                      ),
-                      child: const Icon(
-                        Icons.control_camera_rounded,
-                        color: Colors.white,
-                        size: 30,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        const Text(
-          'Up/Down = drive  •  Left/Right = steer\nDiagonal movement controls both motors together.',
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            color: Colors.white38,
-            fontSize: 10.5,
-            height: 1.45,
-          ),
-        ),
-      ],
-    );
-  }
-
   Widget _buildAutomaticPlaceholder() {
     return _card(
       child: Column(
@@ -979,7 +924,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 ),
                 SizedBox(height: 8),
                 Text(
-                  'The Arduino firmware currently provides only manual motor routes. We will enable automatic mode when the TCRT5000L and VL53L0X logic is added.',
+                  'Automatic mode will be enabled when the TCRT5000L and VL53L0X logic is added to the ESP32 firmware.',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: Colors.white60,
@@ -1014,23 +959,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           _endpointRow('GET /s', 'Stop both motors'),
           const Divider(height: 28),
           const Text(
-            'Joystick behavior',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: Colors.lightBlueAccent,
-            ),
-          ),
-          const SizedBox(height: 6),
-          const Text(
-            'The joystick uses the same /f, /b, /l, /r and /s routes. Diagonal positions send one drive command and one steering command.',
-            style: TextStyle(
-              color: Colors.white54,
-              fontSize: 12,
-              height: 1.4,
-            ),
-          ),
-          const Divider(height: 28),
-          const Text(
             'Current firmware limitation',
             style: TextStyle(
               fontWeight: FontWeight.bold,
@@ -1047,70 +975,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _holdButton({
-    required IconData icon,
-    required String label,
-    required bool active,
-    required bool enabled,
-    required VoidCallback onPressed,
-    required VoidCallback onReleased,
-    required double width,
-  }) {
-    return GestureDetector(
-      onTapDown: enabled ? (_) => onPressed() : null,
-      onTapUp: enabled ? (_) => onReleased() : null,
-      onTapCancel: enabled ? onReleased : null,
-      child: AnimatedOpacity(
-        duration: const Duration(milliseconds: 120),
-        opacity: enabled ? 1 : 0.4,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 100),
-          width: width,
-          height: 67,
-          decoration: BoxDecoration(
-            color: active
-                ? const Color(0xFF1976D2)
-                : const Color(0xFF171B20),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: active ? const Color(0xFF42A5F5) : Colors.white12,
-            ),
-            boxShadow: active
-                ? [
-                    BoxShadow(
-                      color: const Color(0xFF1976D2)
-                          .withValues(alpha: 0.25),
-                      blurRadius: 15,
-                      spreadRadius: 1,
-                    ),
-                  ]
-                : null,
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                icon,
-                size: 27,
-                color: active ? Colors.white : Colors.white70,
-              ),
-              const SizedBox(width: 5),
-              Text(
-                label,
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                  letterSpacing: 0.4,
-                  color: active ? Colors.white : Colors.white70,
-                ),
-              ),
-            ],
-          ),
-        ),
       ),
     );
   }
