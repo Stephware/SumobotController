@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 void main() {
@@ -17,7 +20,7 @@ class SumobotApp extends StatelessWidget {
         useMaterial3: true,
         scaffoldBackgroundColor: const Color(0xFF0B0D10),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1E88E5),
+          seedColor: const Color(0xFF1976D2),
           brightness: Brightness.dark,
         ),
       ),
@@ -26,22 +29,9 @@ class SumobotApp extends StatelessWidget {
   }
 }
 
-enum ControlMode {
-  manual,
-  automatic,
-}
-
-enum DriveDirection {
-  stopped,
-  forward,
-  reverse,
-}
-
-enum SteeringDirection {
-  center,
-  left,
-  right,
-}
+enum ControlMode { manual, automatic }
+enum DriveDirection { stopped, forward, reverse }
+enum SteeringDirection { center, left, right }
 
 class SumobotControllerPage extends StatefulWidget {
   const SumobotControllerPage({super.key});
@@ -52,115 +42,212 @@ class SumobotControllerPage extends StatefulWidget {
 }
 
 class _SumobotControllerPageState extends State<SumobotControllerPage> {
-  ControlMode mode = ControlMode.manual;
+  static const String _ssid = 'ESP32-ROBOT';
+  static const String _password = '12345678';
+  static const String _baseUrl = 'http://192.168.4.1';
 
+  ControlMode mode = ControlMode.manual;
   DriveDirection driveDirection = DriveDirection.stopped;
   SteeringDirection steeringDirection = SteeringDirection.center;
 
-  double driveSpeed = 80;
+  bool isConnected = false;
+  bool isCheckingConnection = false;
+  String connectionMessage = 'Connect to ESP32-ROBOT, then test the connection.';
+  String lastCommand = 'NONE';
 
-  bool isConnected = true;
-  bool autoRunning = false;
+  Future<void> _commandTail = Future<void>.value();
 
-  double attackDistance = 400;
-  double searchSpeed = 55;
-  double attackSpeed = 90;
-  double escapeSpeed = 75;
-
-  // Temporary / dummy sensor values.
-  int frontLeftValue = 735;
-  int frontRightValue = 720;
-  int rearLeftValue = 710;
-  int rearRightValue = 745;
-
-  bool frontLeftEdge = false;
-  bool frontRightEdge = false;
-  bool rearLeftEdge = false;
-  bool rearRightEdge = false;
-
-  int opponentDistance = 327;
-
-  String get robotState {
-    if (!isConnected) {
-      return 'DISCONNECTED';
-    }
-
-    if (mode == ControlMode.manual) {
-      if (driveDirection == DriveDirection.stopped &&
-          steeringDirection == SteeringDirection.center) {
-        return 'IDLE';
-      }
-
-      return 'MANUAL';
-    }
-
-    if (!autoRunning) {
-      return 'AUTO READY';
-    }
-
-    if (frontLeftEdge ||
-        frontRightEdge ||
-        rearLeftEdge ||
-        rearRightEdge) {
-      return 'EDGE ESCAPE';
-    }
-
-    if (opponentDistance <= attackDistance) {
-      return 'ATTACKING';
-    }
-
-    return 'SEARCHING';
-  }
-
-  void emergencyStop() {
-    setState(() {
-      driveDirection = DriveDirection.stopped;
-      steeringDirection = SteeringDirection.center;
-      autoRunning = false;
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _testConnection(showFeedback: false);
     });
   }
 
-  void setDrive(DriveDirection direction) {
-    if (mode != ControlMode.manual) return;
+  Future<bool> _request(
+    String path, {
+    bool updateCommand = false,
+  }) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 2);
+
+    try {
+      final request = await client.getUrl(Uri.parse('$_baseUrl$path'));
+      request.persistentConnection = false;
+
+      final response = await request.close().timeout(
+            const Duration(seconds: 2),
+          );
+      await response.drain();
+
+      final success = response.statusCode == HttpStatus.ok;
+
+      if (!mounted) return success;
+
+      setState(() {
+        isConnected = success;
+        connectionMessage = success
+            ? 'Connected to ESP32 at 192.168.4.1'
+            : 'ESP32 responded with HTTP ${response.statusCode}.';
+        if (success && updateCommand) {
+          lastCommand = path;
+        }
+      });
+
+      return success;
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          isConnected = false;
+          connectionMessage =
+              'No response. Make sure the phone is connected to $_ssid.';
+        });
+      }
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<bool> _queueCommand(String path) {
+    final completer = Completer<bool>();
+
+    _commandTail = _commandTail.then((_) async {
+      final success = await _request(path, updateCommand: true);
+      if (!completer.isCompleted) {
+        completer.complete(success);
+      }
+    });
+
+    return completer.future;
+  }
+
+  Future<void> _testConnection({required bool showFeedback}) async {
+    if (isCheckingConnection) return;
+
+    setState(() {
+      isCheckingConnection = true;
+      connectionMessage = 'Checking ESP32 connection...';
+    });
+
+    final success = await _request('/');
+
+    if (!mounted) return;
+
+    setState(() {
+      isCheckingConnection = false;
+    });
+
+    if (showFeedback) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            success
+                ? 'ESP32 connected successfully.'
+                : 'ESP32 not found. Connect to $_ssid first.',
+          ),
+        ),
+      );
+    }
+  }
+
+  void _pressDrive(DriveDirection direction) {
+    if (!isConnected || mode != ControlMode.manual) return;
 
     setState(() {
       driveDirection = direction;
     });
+
+    final endpoint =
+        direction == DriveDirection.forward ? '/f' : '/b';
+    unawaited(_queueCommand(endpoint));
   }
 
-  void releaseDrive() {
+  void _releaseDrive() {
     if (mode != ControlMode.manual) return;
 
     setState(() {
       driveDirection = DriveDirection.stopped;
     });
+
+    if (isConnected) {
+      unawaited(_stopThenRestoreActiveMotor());
+    }
   }
 
-  void setSteering(SteeringDirection direction) {
-    if (mode != ControlMode.manual) return;
+  void _pressSteering(SteeringDirection direction) {
+    if (!isConnected || mode != ControlMode.manual) return;
 
     setState(() {
       steeringDirection = direction;
     });
+
+    final endpoint =
+        direction == SteeringDirection.left ? '/l' : '/r';
+    unawaited(_queueCommand(endpoint));
   }
 
-  void releaseSteering() {
+  void _releaseSteering() {
     if (mode != ControlMode.manual) return;
 
     setState(() {
-      // Steering motor receives no power.
-      // The RC steering mechanism automatically centers itself.
       steeringDirection = SteeringDirection.center;
     });
+
+    if (isConnected) {
+      unawaited(_stopThenRestoreActiveMotor());
+    }
   }
 
-  void changeMode(ControlMode newMode) {
-    emergencyStop();
+  Future<void> _stopThenRestoreActiveMotor() async {
+    // The current Arduino firmware only has /s, which stops BOTH motors.
+    // After stopping, re-send whichever other control is still being held.
+    final stopped = await _queueCommand('/s');
+    if (!stopped || !mounted) return;
 
+    if (driveDirection == DriveDirection.forward) {
+      await _queueCommand('/f');
+    } else if (driveDirection == DriveDirection.reverse) {
+      await _queueCommand('/b');
+    }
+
+    if (steeringDirection == SteeringDirection.left) {
+      await _queueCommand('/l');
+    } else if (steeringDirection == SteeringDirection.right) {
+      await _queueCommand('/r');
+    }
+  }
+
+  Future<void> _stopAll() async {
+    setState(() {
+      driveDirection = DriveDirection.stopped;
+      steeringDirection = SteeringDirection.center;
+    });
+
+    if (isConnected) {
+      await _queueCommand('/s');
+    }
+  }
+
+  void _changeMode(ControlMode newMode) {
+    unawaited(_stopAll());
     setState(() {
       mode = newMode;
     });
   }
+
+  String get driveText => switch (driveDirection) {
+        DriveDirection.forward => 'FORWARD',
+        DriveDirection.reverse => 'REVERSE',
+        DriveDirection.stopped => 'STOPPED',
+      };
+
+  String get steeringText => switch (steeringDirection) {
+        SteeringDirection.left => 'LEFT',
+        SteeringDirection.right => 'RIGHT',
+        SteeringDirection.center => 'CENTER',
+      };
 
   @override
   Widget build(BuildContext context) {
@@ -175,18 +262,14 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
                 child: Column(
                   children: [
+                    _buildConnectionCard(),
+                    const SizedBox(height: 16),
                     if (mode == ControlMode.manual)
                       _buildManualController()
                     else
-                      _buildAutomaticController(),
-
+                      _buildAutomaticPlaceholder(),
                     const SizedBox(height: 16),
-
-                    _buildSensorMonitor(),
-
-                    const SizedBox(height: 16),
-
-                    _buildRobotStatus(),
+                    _buildFirmwareStatus(),
                   ],
                 ),
               ),
@@ -215,9 +298,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
               size: 29,
             ),
           ),
-
           const SizedBox(width: 14),
-
           const Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -241,40 +322,37 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
               ],
             ),
           ),
+          _connectionBadge(),
+        ],
+      ),
+    );
+  }
 
+  Widget _connectionBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+      decoration: BoxDecoration(
+        color: (isConnected ? Colors.green : Colors.red)
+            .withValues(alpha: 0.13),
+        borderRadius: BorderRadius.circular(30),
+      ),
+      child: Row(
+        children: [
           Container(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 11,
-              vertical: 7,
-            ),
+            width: 8,
+            height: 8,
             decoration: BoxDecoration(
-              color: isConnected
-                  ? Colors.green.withValues(alpha: 0.13)
-                  : Colors.red.withValues(alpha: 0.13),
-              borderRadius: BorderRadius.circular(30),
+              color: isConnected ? Colors.greenAccent : Colors.redAccent,
+              shape: BoxShape.circle,
             ),
-            child: Row(
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color:
-                        isConnected ? Colors.greenAccent : Colors.redAccent,
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                const SizedBox(width: 7),
-                Text(
-                  isConnected ? 'Connected' : 'Offline',
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color:
-                        isConnected ? Colors.greenAccent : Colors.redAccent,
-                  ),
-                ),
-              ],
+          ),
+          const SizedBox(width: 7),
+          Text(
+            isConnected ? 'Connected' : 'Offline',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: isConnected ? Colors.greenAccent : Colors.redAccent,
             ),
           ),
         ],
@@ -298,7 +376,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 title: 'MANUAL',
                 icon: Icons.gamepad_rounded,
                 selected: mode == ControlMode.manual,
-                onTap: () => changeMode(ControlMode.manual),
+                onTap: () => _changeMode(ControlMode.manual),
               ),
             ),
             Expanded(
@@ -306,7 +384,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 title: 'AUTOMATIC',
                 icon: Icons.auto_mode_rounded,
                 selected: mode == ControlMode.automatic,
-                onTap: () => changeMode(ControlMode.automatic),
+                onTap: () => _changeMode(ControlMode.automatic),
               ),
             ),
           ],
@@ -353,6 +431,60 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
+  Widget _buildConnectionCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _sectionHeader(
+            icon: Icons.wifi_rounded,
+            title: 'ESP32 Connection',
+            subtitle: 'Connect the phone to the ESP32 access point first',
+          ),
+          const SizedBox(height: 18),
+          _infoRow('Wi-Fi', _ssid),
+          _infoRow('Password', _password),
+          _infoRow('ESP32 IP', '192.168.4.1'),
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF101318),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              connectionMessage,
+              style: TextStyle(
+                color: isConnected ? Colors.greenAccent : Colors.white60,
+                fontSize: 12,
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: isCheckingConnection
+                  ? null
+                  : () => _testConnection(showFeedback: true),
+              icon: isCheckingConnection
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync_rounded),
+              label: Text(
+                isCheckingConnection ? 'CHECKING...' : 'TEST CONNECTION',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildManualController() {
     return _card(
       child: Column(
@@ -360,22 +492,21 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           _sectionHeader(
             icon: Icons.gamepad_rounded,
             title: 'Manual Control',
-            subtitle: 'Hold buttons to control the robot',
+            subtitle: isConnected
+                ? 'Commands are sent directly to the ESP32'
+                : 'Connect to the ESP32 before using the controls',
           ),
-
           const SizedBox(height: 26),
-
           _holdButton(
             icon: Icons.keyboard_arrow_up_rounded,
             label: 'FORWARD',
             active: driveDirection == DriveDirection.forward,
-            onPressed: () => setDrive(DriveDirection.forward),
-            onReleased: releaseDrive,
+            enabled: isConnected,
+            onPressed: () => _pressDrive(DriveDirection.forward),
+            onReleased: _releaseDrive,
             width: 145,
           ),
-
           const SizedBox(height: 16),
-
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -383,42 +514,37 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 icon: Icons.keyboard_arrow_left_rounded,
                 label: 'LEFT',
                 active: steeringDirection == SteeringDirection.left,
-                onPressed: () =>
-                    setSteering(SteeringDirection.left),
-                onReleased: releaseSteering,
+                enabled: isConnected,
+                onPressed: () => _pressSteering(SteeringDirection.left),
+                onReleased: _releaseSteering,
                 width: 125,
               ),
-
               const SizedBox(width: 18),
-
               _holdButton(
                 icon: Icons.keyboard_arrow_right_rounded,
                 label: 'RIGHT',
                 active: steeringDirection == SteeringDirection.right,
-                onPressed: () =>
-                    setSteering(SteeringDirection.right),
-                onReleased: releaseSteering,
+                enabled: isConnected,
+                onPressed: () => _pressSteering(SteeringDirection.right),
+                onReleased: _releaseSteering,
                 width: 125,
               ),
             ],
           ),
-
           const SizedBox(height: 16),
-
           _holdButton(
             icon: Icons.keyboard_arrow_down_rounded,
             label: 'REVERSE',
             active: driveDirection == DriveDirection.reverse,
-            onPressed: () => setDrive(DriveDirection.reverse),
-            onReleased: releaseDrive,
+            enabled: isConnected,
+            onPressed: () => _pressDrive(DriveDirection.reverse),
+            onReleased: _releaseDrive,
             width: 145,
           ),
-
-          const SizedBox(height: 28),
-
+          const SizedBox(height: 26),
           SizedBox(
             width: double.infinity,
-            height: 53,
+            height: 54,
             child: FilledButton.icon(
               style: FilledButton.styleFrom(
                 backgroundColor: const Color(0xFFD32F2F),
@@ -427,99 +553,42 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   borderRadius: BorderRadius.circular(14),
                 ),
               ),
-              onPressed: emergencyStop,
+              onPressed: isConnected ? () => unawaited(_stopAll()) : null,
               icon: const Icon(Icons.stop_circle_outlined),
               label: const Text(
-                'STOP',
+                'STOP ALL',
                 style: TextStyle(
-                  fontSize: 16,
+                  fontSize: 15,
                   fontWeight: FontWeight.bold,
-                  letterSpacing: 1,
+                  letterSpacing: 0.8,
                 ),
               ),
             ),
           ),
-
-          const SizedBox(height: 28),
-
-          _sliderHeader(
-            title: 'Drive Speed',
-            value: '${driveSpeed.round()}%',
+          const SizedBox(height: 18),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xFF101318),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              children: [
+                _infoRow('Drive', driveText),
+                _infoRow('Steering', steeringText),
+                _infoRow('Last endpoint', lastCommand),
+              ],
+            ),
           ),
-
-          Slider(
-            value: driveSpeed,
-            min: 0,
-            max: 100,
-            divisions: 20,
-            label: '${driveSpeed.round()}%',
-            onChanged: (value) {
-              setState(() {
-                driveSpeed = value;
-              });
-            },
-          ),
-
-          const SizedBox(height: 8),
-
-          _manualCommandIndicator(),
-        ],
-      ),
-    );
-  }
-
-  Widget _manualCommandIndicator() {
-    String driveText;
-
-    switch (driveDirection) {
-      case DriveDirection.forward:
-        driveText = 'FORWARD';
-        break;
-      case DriveDirection.reverse:
-        driveText = 'REVERSE';
-        break;
-      case DriveDirection.stopped:
-        driveText = 'STOPPED';
-        break;
-    }
-
-    String steeringText;
-
-    switch (steeringDirection) {
-      case SteeringDirection.left:
-        steeringText = 'LEFT';
-        break;
-      case SteeringDirection.right:
-        steeringText = 'RIGHT';
-        break;
-      case SteeringDirection.center:
-        steeringText = 'CENTER';
-        break;
-    }
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF101318),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        children: [
-          const Icon(
-            Icons.memory_rounded,
-            color: Colors.white38,
-            size: 20,
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              'Drive: $driveText   •   Steering: $steeringText',
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-              ),
+          const SizedBox(height: 12),
+          const Text(
+            'Speed control is not shown because the current Arduino firmware does not use ENA/ENB PWM.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white38,
+              fontSize: 11,
+              height: 1.4,
             ),
           ),
         ],
@@ -527,336 +596,51 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _buildAutomaticController() {
+  Widget _buildAutomaticPlaceholder() {
     return _card(
       child: Column(
         children: [
           _sectionHeader(
             icon: Icons.auto_mode_rounded,
             title: 'Automatic Mode',
-            subtitle: 'ESP32 autonomous Sumobot control',
+            subtitle: 'Reserved for the autonomous Sumobot firmware',
           ),
-
           const SizedBox(height: 22),
-
-          _autoStatusPanel(),
-
-          const SizedBox(height: 25),
-
-          _sliderHeader(
-            title: 'Attack Distance',
-            value: '${attackDistance.round()} mm',
-          ),
-
-          Slider(
-            value: attackDistance,
-            min: 100,
-            max: 1000,
-            divisions: 18,
-            label: '${attackDistance.round()} mm',
-            onChanged: autoRunning
-                ? null
-                : (value) {
-                    setState(() {
-                      attackDistance = value;
-                    });
-                  },
-          ),
-
-          const SizedBox(height: 8),
-
-          _sliderHeader(
-            title: 'Search Speed',
-            value: '${searchSpeed.round()}%',
-          ),
-
-          Slider(
-            value: searchSpeed,
-            min: 20,
-            max: 100,
-            divisions: 16,
-            onChanged: autoRunning
-                ? null
-                : (value) {
-                    setState(() {
-                      searchSpeed = value;
-                    });
-                  },
-          ),
-
-          const SizedBox(height: 8),
-
-          _sliderHeader(
-            title: 'Attack Speed',
-            value: '${attackSpeed.round()}%',
-          ),
-
-          Slider(
-            value: attackSpeed,
-            min: 20,
-            max: 100,
-            divisions: 16,
-            onChanged: autoRunning
-                ? null
-                : (value) {
-                    setState(() {
-                      attackSpeed = value;
-                    });
-                  },
-          ),
-
-          const SizedBox(height: 8),
-
-          _sliderHeader(
-            title: 'Edge Escape Speed',
-            value: '${escapeSpeed.round()}%',
-          ),
-
-          Slider(
-            value: escapeSpeed,
-            min: 20,
-            max: 100,
-            divisions: 16,
-            onChanged: autoRunning
-                ? null
-                : (value) {
-                    setState(() {
-                      escapeSpeed = value;
-                    });
-                  },
-          ),
-
-          const SizedBox(height: 24),
-
-          SizedBox(
-            width: double.infinity,
-            height: 54,
-            child: FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: autoRunning
-                    ? const Color(0xFFD32F2F)
-                    : const Color(0xFF1565C0),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-              onPressed: () {
-                setState(() {
-                  autoRunning = !autoRunning;
-
-                  if (!autoRunning) {
-                    driveDirection = DriveDirection.stopped;
-                    steeringDirection = SteeringDirection.center;
-                  }
-                });
-              },
-              icon: Icon(
-                autoRunning
-                    ? Icons.stop_rounded
-                    : Icons.play_arrow_rounded,
-              ),
-              label: Text(
-                autoRunning
-                    ? 'STOP AUTONOMOUS'
-                    : 'START AUTONOMOUS',
-                style: const TextStyle(
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.5,
-                ),
-              ),
-            ),
-          ),
-
-          const SizedBox(height: 12),
-
-          SizedBox(
-            width: double.infinity,
-            height: 51,
-            child: OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.redAccent,
-                side: const BorderSide(
-                  color: Colors.redAccent,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-              onPressed: emergencyStop,
-              icon: const Icon(Icons.warning_amber_rounded),
-              label: const Text(
-                'EMERGENCY STOP',
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _autoStatusPanel() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: const Color(0xFF101318),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: autoRunning
-              ? const Color(0xFF1565C0).withValues(alpha: 0.65)
-              : Colors.white10,
-        ),
-      ),
-      child: Column(
-        children: [
-          const Text(
-            'CURRENT STATE',
-            style: TextStyle(
-              color: Colors.white38,
-              fontSize: 11,
-              letterSpacing: 1.5,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 7),
-          Text(
-            robotState,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: _stateColor(),
-              fontSize: 21,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 1,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            autoRunning
-                ? 'Autonomous control is active'
-                : 'Robot is waiting to start',
-            style: const TextStyle(
-              color: Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSensorMonitor() {
-    return _card(
-      child: Column(
-        children: [
-          _sectionHeader(
-            icon: Icons.sensors_rounded,
-            title: 'Live Sensors',
-            subtitle: 'Temporary simulated sensor readings',
-          ),
-
-          const SizedBox(height: 20),
-
-          Row(
-            children: [
-              Expanded(
-                child: _sensorTile(
-                  label: 'Front Left',
-                  shortLabel: 'FL',
-                  value: frontLeftValue,
-                  edgeDetected: frontLeftEdge,
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _sensorTile(
-                  label: 'Front Right',
-                  shortLabel: 'FR',
-                  value: frontRightValue,
-                  edgeDetected: frontRightEdge,
-                ),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 10),
-
-          Row(
-            children: [
-              Expanded(
-                child: _sensorTile(
-                  label: 'Rear Left',
-                  shortLabel: 'RL',
-                  value: rearLeftValue,
-                  edgeDetected: rearLeftEdge,
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _sensorTile(
-                  label: 'Rear Right',
-                  shortLabel: 'RR',
-                  value: rearRightValue,
-                  edgeDetected: rearRightEdge,
-                ),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 18),
-
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(17),
+            padding: const EdgeInsets.all(18),
             decoration: BoxDecoration(
-              color: const Color(0xFF101318),
+              color: Colors.amber.withValues(alpha: 0.08),
               borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: Colors.amber.withValues(alpha: 0.25),
+              ),
             ),
-            child: Row(
+            child: const Column(
               children: [
-                Container(
-                  height: 45,
-                  width: 45,
-                  decoration: BoxDecoration(
-                    color: Colors.blue.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Icon(
-                    Icons.radar_rounded,
-                    color: Colors.lightBlueAccent,
-                  ),
+                Icon(
+                  Icons.construction_rounded,
+                  color: Colors.amberAccent,
+                  size: 34,
                 ),
-                const SizedBox(width: 14),
-                const Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'VL53L0X',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 14,
-                        ),
-                      ),
-                      SizedBox(height: 2),
-                      Text(
-                        'Opponent Distance',
-                        style: TextStyle(
-                          color: Colors.white54,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+                SizedBox(height: 12),
                 Text(
-                  '$opponentDistance mm',
-                  style: const TextStyle(
-                    color: Colors.lightBlueAccent,
-                    fontSize: 20,
+                  'NOT YET SUPPORTED BY THE CURRENT ESP32 CODE',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.amberAccent,
                     fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'The Arduino firmware currently provides only manual motor routes. We will enable automatic mode when the TCRT5000L and VL53L0X logic is added.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white60,
+                    height: 1.45,
+                    fontSize: 12,
                   ),
                 ),
               ],
@@ -867,167 +651,38 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _sensorTile({
-    required String label,
-    required String shortLabel,
-    required int value,
-    required bool edgeDetected,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF101318),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: edgeDetected
-              ? Colors.redAccent.withValues(alpha: 0.7)
-              : Colors.greenAccent.withValues(alpha: 0.15),
-        ),
-      ),
+  Widget _buildFirmwareStatus() {
+    return _card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Container(
-                height: 30,
-                width: 30,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: edgeDetected
-                      ? Colors.red.withValues(alpha: 0.15)
-                      : Colors.green.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  shortLabel,
-                  style: TextStyle(
-                    color: edgeDetected
-                        ? Colors.redAccent
-                        : Colors.greenAccent,
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-              const Spacer(),
-              Text(
-                edgeDetected ? 'EDGE' : 'SAFE',
-                style: TextStyle(
-                  color: edgeDetected
-                      ? Colors.redAccent
-                      : Colors.greenAccent,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 11,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 13),
-          Text(
-            label,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 12,
-            ),
-          ),
-          const SizedBox(height: 3),
-          Text(
-            '$value',
-            style: const TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 19,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRobotStatus() {
-    return _card(
-      child: Column(
-        children: [
           _sectionHeader(
-            icon: Icons.info_outline_rounded,
-            title: 'Robot Status',
-            subtitle: 'Current control output',
+            icon: Icons.route_rounded,
+            title: 'Current ESP32 Endpoints',
+            subtitle: 'Matches the Arduino WebServer code',
           ),
-
           const SizedBox(height: 18),
-
-          _statusRow(
-            'Mode',
-            mode == ControlMode.manual ? 'MANUAL' : 'AUTOMATIC',
-          ),
-
-          _statusRow(
-            'Robot State',
-            robotState,
-            valueColor: _stateColor(),
-          ),
-
-          _statusRow(
-            'Drive',
-            driveDirection.name.toUpperCase(),
-          ),
-
-          _statusRow(
-            'Steering',
-            steeringDirection.name.toUpperCase(),
-          ),
-
-          _statusRow(
-            'Drive Speed',
-            '${driveSpeed.round()}%',
-          ),
-        ],
-      ),
-    );
-  }
-
-  Color _stateColor() {
-    switch (robotState) {
-      case 'ATTACKING':
-        return Colors.redAccent;
-      case 'EDGE ESCAPE':
-        return Colors.orangeAccent;
-      case 'SEARCHING':
-        return Colors.lightBlueAccent;
-      case 'MANUAL':
-        return Colors.greenAccent;
-      case 'AUTO READY':
-        return Colors.amberAccent;
-      case 'DISCONNECTED':
-        return Colors.redAccent;
-      default:
-        return Colors.white70;
-    }
-  }
-
-  Widget _statusRow(
-    String label,
-    String value, {
-    Color valueColor = Colors.white,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
-        children: [
-          Text(
-            label,
-            style: const TextStyle(
-              color: Colors.white54,
-              fontSize: 13,
+          _endpointRow('GET /', 'Connection test / ESP32 web page'),
+          _endpointRow('GET /f', 'Rear drive forward'),
+          _endpointRow('GET /b', 'Rear drive reverse'),
+          _endpointRow('GET /l', 'Steering left'),
+          _endpointRow('GET /r', 'Steering right'),
+          _endpointRow('GET /s', 'Stop both motors'),
+          const Divider(height: 28),
+          const Text(
+            'Current firmware limitation',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: Colors.orangeAccent,
             ),
           ),
-          const Spacer(),
-          Text(
-            value,
+          const SizedBox(height: 6),
+          const Text(
+            'There is no separate drive-stop or steering-stop endpoint yet. Flutter uses /s and then restores the other control if it is still being held.',
             style: TextStyle(
-              color: valueColor,
-              fontSize: 13,
-              fontWeight: FontWeight.bold,
+              color: Colors.white54,
+              fontSize: 12,
+              height: 1.4,
             ),
           ),
         ],
@@ -1039,85 +694,63 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     required IconData icon,
     required String label,
     required bool active,
+    required bool enabled,
     required VoidCallback onPressed,
     required VoidCallback onReleased,
     required double width,
   }) {
     return GestureDetector(
-      onTapDown: (_) => onPressed(),
-      onTapUp: (_) => onReleased(),
-      onTapCancel: onReleased,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 100),
-        width: width,
-        height: 67,
-        decoration: BoxDecoration(
-          color: active
-              ? const Color(0xFF1976D2)
-              : const Color(0xFF171B20),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
+      onTapDown: enabled ? (_) => onPressed() : null,
+      onTapUp: enabled ? (_) => onReleased() : null,
+      onTapCancel: enabled ? onReleased : null,
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 120),
+        opacity: enabled ? 1 : 0.4,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          width: width,
+          height: 67,
+          decoration: BoxDecoration(
             color: active
-                ? const Color(0xFF42A5F5)
-                : Colors.white12,
-          ),
-          boxShadow: active
-              ? [
-                  BoxShadow(
-                    color: const Color(0xFF1976D2).withValues(alpha: 0.25),
-                    blurRadius: 15,
-                    spreadRadius: 1,
-                  ),
-                ]
-              : null,
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              icon,
-              size: 27,
-              color: active ? Colors.white : Colors.white70,
+                ? const Color(0xFF1976D2)
+                : const Color(0xFF171B20),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: active ? const Color(0xFF42A5F5) : Colors.white12,
             ),
-            const SizedBox(width: 5),
-            Text(
-              label,
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 12,
-                letterSpacing: 0.4,
+            boxShadow: active
+                ? [
+                    BoxShadow(
+                      color: const Color(0xFF1976D2)
+                          .withValues(alpha: 0.25),
+                      blurRadius: 15,
+                      spreadRadius: 1,
+                    ),
+                  ]
+                : null,
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 27,
                 color: active ? Colors.white : Colors.white70,
               ),
-            ),
-          ],
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                  letterSpacing: 0.4,
+                  color: active ? Colors.white : Colors.white70,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
-    );
-  }
-
-  Widget _sliderHeader({
-    required String title,
-    required String value,
-  }) {
-    return Row(
-      children: [
-        Text(
-          title,
-          style: const TextStyle(
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        const Spacer(),
-        Text(
-          value,
-          style: const TextStyle(
-            color: Colors.lightBlueAccent,
-            fontWeight: FontWeight.bold,
-            fontSize: 13,
-          ),
-        ),
-      ],
     );
   }
 
@@ -1168,9 +801,66 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _card({
-    required Widget child,
-  }) {
+  Widget _infoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white54,
+              fontSize: 12,
+            ),
+          ),
+          const Spacer(),
+          Flexible(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                fontWeight: FontWeight.w600,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _endpointRow(String endpoint, String description) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 76,
+            child: Text(
+              endpoint,
+              style: const TextStyle(
+                color: Colors.lightBlueAccent,
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              description,
+              style: const TextStyle(
+                color: Colors.white60,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _card({required Widget child}) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(18),
