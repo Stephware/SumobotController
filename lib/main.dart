@@ -165,7 +165,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      safeArea: true,
       body: SafeArea(
         child: Column(
           children: [
@@ -207,7 +206,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             height: 48,
             width: 48,
             decoration: BoxDecoration(
-              color: const Color(0xFF1E88E5).withOpacity(0.15),
+              color: const Color(0xFF1E88E5).withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(14),
             ),
             child: const Icon(
@@ -250,8 +249,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             ),
             decoration: BoxDecoration(
               color: isConnected
-                  ? Colors.green.withOpacity(0.13)
-                  : Colors.red.withOpacity(0.13),
+                  ? Colors.green.withValues(alpha: 0.13)
+                  : Colors.red.withValues(alpha: 0.13),
               borderRadius: BorderRadius.circular(30),
             ),
             child: Row(
@@ -261,7 +260,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   height: 8,
                   decoration: BoxDecoration(
                     color:
-                    isConnected ? Colors.greenAccent : Colors.redAccent,
+                        isConnected ? Colors.greenAccent : Colors.redAccent,
                     shape: BoxShape.circle,
                   ),
                 ),
@@ -272,7 +271,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
                     color:
-                    isConnected ? Colors.greenAccent : Colors.redAccent,
+                        isConnected ? Colors.greenAccent : Colors.redAccent,
                   ),
                 ),
               ],
@@ -558,10 +557,10 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             onChanged: autoRunning
                 ? null
                 : (value) {
-              setState(() {
-                attackDistance = value;
-              });
-            },
+                    setState(() {
+                      attackDistance = value;
+                    });
+                  },
           ),
 
           const SizedBox(height: 8),
@@ -579,10 +578,10 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             onChanged: autoRunning
                 ? null
                 : (value) {
-              setState(() {
-                searchSpeed = value;
-              });
-            },
+                    setState(() {
+                      searchSpeed = value;
+                    });
+                  },
           ),
 
           const SizedBox(height: 8),
@@ -600,10 +599,10 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             onChanged: autoRunning
                 ? null
                 : (value) {
-              setState(() {
-                attackSpeed = value;
-              });
-            },
+                    setState(() {
+                      attackSpeed = value;
+                    });
+                  },
           ),
 
           const SizedBox(height: 8),
@@ -621,10 +620,10 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             onChanged: autoRunning
                 ? null
                 : (value) {
-              setState(() {
-                escapeSpeed = value;
-              });
-            },
+                    setState(() {
+                      escapeSpeed = value;
+                    });
+                  },
           ),
 
           const SizedBox(height: 24),
@@ -707,7 +706,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: autoRunning
-              ? const Color(0xFF1565C0).withOpacity(0.65)
+              ? const Color(0xFF1565C0).withValues(alpha: 0.65)
               : Colors.white10,
         ),
       ),
@@ -821,7 +820,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   height: 45,
                   width: 45,
                   decoration: BoxDecoration(
-                    color: Colors.blue.withOpacity(0.12),
+                    color: Colors.blue.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: const Icon(
@@ -881,8 +880,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: edgeDetected
-              ? Colors.redAccent.withOpacity(0.7)
-              : Colors.greenAccent.withOpacity(0.15),
+              ? Colors.redAccent.withValues(alpha: 0.7)
+              : Colors.greenAccent.withValues(alpha: 0.15),
         ),
       ),
       child: Column(
@@ -896,8 +895,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 alignment: Alignment.center,
                 decoration: BoxDecoration(
                   color: edgeDetected
-                      ? Colors.red.withOpacity(0.15)
-                      : Colors.green.withOpacity(0.12),
+                      ? Colors.red.withValues(alpha: 0.15)
+                      : Colors.green.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
@@ -1007,10 +1006,10 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   }
 
   Widget _statusRow(
-      String label,
-      String value, {
-        Color valueColor = Colors.white,
-      }) {
+    String label,
+    String value, {
+    Color valueColor = Colors.white,
+  }) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
       child: Row(
@@ -1064,12 +1063,12 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           ),
           boxShadow: active
               ? [
-            BoxShadow(
-              color: const Color(0xFF1976D2).withOpacity(0.25),
-              blurRadius: 15,
-              spreadRadius: 1,
-            ),
-          ]
+                  BoxShadow(
+                    color: const Color(0xFF1976D2).withValues(alpha: 0.25),
+                    blurRadius: 15,
+                    spreadRadius: 1,
+                  ),
+                ]
               : null,
         ),
         child: Row(
@@ -1133,7 +1132,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           width: 40,
           height: 40,
           decoration: BoxDecoration(
-            color: const Color(0xFF1565C0).withOpacity(0.15),
+            color: const Color(0xFF1565C0).withValues(alpha: 0.15),
             borderRadius: BorderRadius.circular(11),
           ),
           child: Icon(
@@ -1179,7 +1178,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         color: const Color(0xFF14171C),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(
-          color: Colors.white.withOpacity(0.055),
+          color: Colors.white.withValues(alpha: 0.055),
         ),
       ),
       child: child,
