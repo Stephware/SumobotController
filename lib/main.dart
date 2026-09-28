@@ -241,7 +241,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         lastStatusUpdate = DateTime.now();
       });
     } catch (_) {
-      // Keep the last valid readings if one status response is incomplete.
+      // Keep the last valid sensor values if a status response is incomplete.
     } finally {
       _statusRequestInFlight = false;
     }
@@ -334,11 +334,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     await _fetchStatus();
   }
 
-  // The chassis orientation is reversed physically:
-  // - Joystick FORWARD must use the Arduino reverse route (/b)
-  // - Joystick REVERSE must use the Arduino forward route (/f)
-  // - Joystick LEFT must use the Arduino right route (/r)
-  // - Joystick RIGHT must use the Arduino left route (/l)
+  // Your chassis is physically reversed, so the single-axis commands remain
+  // inverted relative to the labels shown to the user.
   String? _driveEndpoint(DriveDirection direction) {
     return switch (direction) {
       DriveDirection.forward => '/b',
@@ -355,6 +352,44 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     };
   }
 
+  // Combined Arduino endpoints:
+  // /fl = Arduino forward + left
+  // /fr = Arduino forward + right
+  // /rl = Arduino reverse + left
+  // /rr = Arduino reverse + right
+  //
+  // Since BOTH axes are inverted for this chassis, the joystick mapping is:
+  // UI forward-left  -> Arduino reverse-right -> /rr
+  // UI forward-right -> Arduino reverse-left  -> /rl
+  // UI reverse-left  -> Arduino forward-right -> /fr
+  // UI reverse-right -> Arduino forward-left  -> /fl
+  String? _diagonalEndpoint(
+    DriveDirection drive,
+    SteeringDirection steering,
+  ) {
+    if (drive == DriveDirection.forward &&
+        steering == SteeringDirection.left) {
+      return '/rr';
+    }
+
+    if (drive == DriveDirection.forward &&
+        steering == SteeringDirection.right) {
+      return '/rl';
+    }
+
+    if (drive == DriveDirection.reverse &&
+        steering == SteeringDirection.left) {
+      return '/fr';
+    }
+
+    if (drive == DriveDirection.reverse &&
+        steering == SteeringDirection.right) {
+      return '/fl';
+    }
+
+    return null;
+  }
+
   void _updateJoystick(Offset localPosition) {
     if (!isConnected || mode != ControlMode.manual) return;
 
@@ -368,8 +403,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       offset = offset * (maxTravel / distance);
     }
 
-    // Keep the UI intuitive: dragging up still means FORWARD to the user.
-    // Only the endpoint sent to the reversed chassis is inverted.
     final newDrive = offset.dy < -_joystickDeadZone
         ? DriveDirection.forward
         : offset.dy > _joystickDeadZone
@@ -426,14 +459,26 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     required DriveDirection newDrive,
     required SteeringDirection newSteering,
   }) async {
+    // If both joystick axes are active, send ONE combined endpoint instead of
+    // separate drive + steering requests. This prevents the two commands from
+    // fighting each other or arriving out of order.
+    final diagonalEndpoint = _diagonalEndpoint(newDrive, newSteering);
+    if (diagonalEndpoint != null) {
+      await _queueCommand(diagonalEndpoint);
+      return;
+    }
+
+    final oldWasDiagonal = oldDrive != DriveDirection.stopped &&
+        oldSteering != SteeringDirection.center;
+
     final driveWasReleased = oldDrive != DriveDirection.stopped &&
         newDrive == DriveDirection.stopped;
     final steeringWasReleased = oldSteering != SteeringDirection.center &&
         newSteering == SteeringDirection.center;
 
-    // The firmware has one shared stop endpoint. If either axis returns to
-    // neutral, stop both first and restore the remaining active axis.
-    if (driveWasReleased || steeringWasReleased) {
+    // When leaving a diagonal state, or when one axis returns to neutral,
+    // clear both motors first. Then restore only the axis still requested.
+    if (oldWasDiagonal || driveWasReleased || steeringWasReleased) {
       final stopped = await _queueCommand('/s');
       if (!stopped || !mounted) return;
 
@@ -705,7 +750,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   const SizedBox(height: 4),
                   Text(
                     isConnected
-                        ? 'Controls are mapped to the reversed chassis'
+                        ? 'Diagonal movement now uses FL / FR / RL / RR routes'
                         : 'Connect to ESP32-ROBOT to enable control',
                     style: const TextStyle(
                       color: Colors.white38,
@@ -1411,7 +1456,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             ),
           ),
           const SizedBox(height: 8),
-          _endpointRow('/f  /b  /l  /r  /s', 'Manual motor routes'),
+          _endpointRow('/f  /b  /l  /r  /s', 'Single-axis manual control'),
+          _endpointRow('/fl  /fr  /rl  /rr', 'Combined diagonal control'),
           _endpointRow('/auto/start', 'Start autonomous mode'),
           _endpointRow('/auto/stop', 'Stop autonomous mode'),
           _endpointRow('/status', 'Mode, state, ToF and edge readings'),
@@ -1474,13 +1520,13 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   }
 
   Color _stateColor() {
-    return switch (robotState) {
-      'ATTACKING' => Colors.redAccent,
-      'EDGE_ESCAPE' => Colors.orangeAccent,
-      'ALIGN_LEFT' || 'ALIGN_RIGHT' => Colors.lightBlueAccent,
-      'SEARCHING' => Colors.amberAccent,
-      _ => Colors.white54,
-    };
+    if (robotState == 'ATTACKING') return Colors.redAccent;
+    if (robotState == 'EDGE_ESCAPE') return Colors.orangeAccent;
+    if (robotState == 'ALIGN_LEFT' || robotState == 'ALIGN_RIGHT') {
+      return Colors.lightBlueAccent;
+    }
+    if (robotState == 'SEARCHING') return Colors.amberAccent;
+    return Colors.white54;
   }
 
   String _timeText(DateTime time) {
@@ -1570,7 +1616,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 112,
+            width: 124,
             child: Text(
               endpoint,
               style: const TextStyle(
