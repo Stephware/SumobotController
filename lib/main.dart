@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -46,6 +47,11 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   static const String _password = '12345678';
   static const String _baseUrl = 'http://192.168.4.1';
 
+  // These mirror the current Arduino firmware.
+  static const int _opponentDetectionDistanceMm = 700;
+  static const int _edgeThreshold = 1800;
+  static const bool _edgeIsHigh = true;
+
   static const double _joystickSize = 220;
   static const double _joystickKnobSize = 72;
   static const double _joystickDeadZone = 24;
@@ -56,62 +62,100 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
   bool isConnected = false;
   bool isCheckingConnection = false;
+  bool _statusRequestInFlight = false;
+
   String connectionMessage =
       'Connect to ESP32-ROBOT, then test the connection.';
   String lastCommand = 'NONE';
 
+  String espMode = 'MANUAL';
+  String robotState = 'IDLE';
+
+  int tofLeft = 8190;
+  int tofCenter = 8190;
+  int tofRight = 8190;
+
+  int edgeFrontLeft = 0;
+  int edgeFrontRight = 0;
+  int edgeRearLeft = 0;
+  int edgeRearRight = 0;
+
+  DateTime? lastStatusUpdate;
+
   Offset _joystickOffset = Offset.zero;
   Future<void> _commandTail = Future<void>.value();
+  Timer? _statusTimer;
 
   @override
   void initState() {
     super.initState();
+
+    _statusTimer = Timer.periodic(
+      const Duration(milliseconds: 900),
+      (_) {
+        if (isConnected) {
+          unawaited(_fetchStatus());
+        }
+      },
+    );
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _testConnection(showFeedback: false);
     });
   }
 
-  Future<bool> _request(
+  @override
+  void dispose() {
+    _statusTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<String?> _get(
     String path, {
     bool updateCommand = false,
+    bool affectConnection = true,
   }) async {
     final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 2);
+      ..connectionTimeout = const Duration(seconds: 3);
 
     try {
       final request = await client.getUrl(Uri.parse('$_baseUrl$path'));
       request.persistentConnection = false;
 
       final response = await request.close().timeout(
-            const Duration(seconds: 2),
+            const Duration(seconds: 3),
           );
-      await response.drain();
+      final body = await utf8.decoder.bind(response).join();
 
       final success = response.statusCode == HttpStatus.ok;
 
-      if (!mounted) return success;
+      if (!mounted) return success ? body : null;
 
-      setState(() {
-        isConnected = success;
-        connectionMessage = success
-            ? 'Connected to ESP32 at 192.168.4.1'
-            : 'ESP32 responded with HTTP ${response.statusCode}.';
+      if (affectConnection || success) {
+        setState(() {
+          if (affectConnection) {
+            isConnected = success;
+            connectionMessage = success
+                ? 'Connected to ESP32 at 192.168.4.1'
+                : 'ESP32 responded with HTTP ${response.statusCode}.';
+          }
 
-        if (success && updateCommand) {
-          lastCommand = path;
-        }
-      });
+          if (success && updateCommand) {
+            lastCommand = path;
+          }
+        });
+      }
 
-      return success;
+      return success ? body : null;
     } catch (_) {
-      if (mounted) {
+      if (mounted && affectConnection) {
         setState(() {
           isConnected = false;
           connectionMessage =
               'No response. Make sure the phone is connected to $_ssid.';
         });
       }
-      return false;
+      return null;
     } finally {
       client.close(force: true);
     }
@@ -121,9 +165,9 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     final completer = Completer<bool>();
 
     _commandTail = _commandTail.then((_) async {
-      final success = await _request(path, updateCommand: true);
+      final body = await _get(path, updateCommand: true);
       if (!completer.isCompleted) {
-        completer.complete(success);
+        completer.complete(body != null);
       }
     });
 
@@ -138,7 +182,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       connectionMessage = 'Checking ESP32 connection...';
     });
 
-    final success = await _request('/');
+    final body = await _get('/');
+    final success = body != null;
 
     if (!mounted) return;
 
@@ -146,7 +191,11 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       isCheckingConnection = false;
     });
 
-    if (showFeedback) {
+    if (success) {
+      await _fetchStatus();
+    }
+
+    if (showFeedback && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -157,6 +206,65 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         ),
       );
     }
+  }
+
+  Future<void> _fetchStatus() async {
+    if (_statusRequestInFlight || !isConnected) return;
+
+    _statusRequestInFlight = true;
+
+    try {
+      // Do not mark the ESP32 offline from one missed status request because
+      // the current autonomous firmware contains short blocking motor delays.
+      final body = await _get('/status', affectConnection: false);
+      if (body == null || !mounted) return;
+
+      final decoded = jsonDecode(body);
+      if (decoded is! Map<String, dynamic>) return;
+
+      final tof = decoded['tof'];
+      final edge = decoded['edge'];
+
+      setState(() {
+        espMode = decoded['mode']?.toString() ?? espMode;
+        robotState = decoded['state']?.toString() ?? robotState;
+
+        if (tof is Map<String, dynamic>) {
+          tofLeft = _asInt(tof['left'], tofLeft);
+          tofCenter = _asInt(tof['center'], tofCenter);
+          tofRight = _asInt(tof['right'], tofRight);
+        }
+
+        if (edge is Map<String, dynamic>) {
+          edgeFrontLeft = _asInt(edge['frontLeft'], edgeFrontLeft);
+          edgeFrontRight = _asInt(edge['frontRight'], edgeFrontRight);
+          edgeRearLeft = _asInt(edge['rearLeft'], edgeRearLeft);
+          edgeRearRight = _asInt(edge['rearRight'], edgeRearRight);
+        }
+
+        lastStatusUpdate = DateTime.now();
+      });
+    } catch (_) {
+      // Keep the last good sensor values if one response is incomplete.
+    } finally {
+      _statusRequestInFlight = false;
+    }
+  }
+
+  int _asInt(dynamic value, int fallback) {
+    if (value is int) return value;
+    if (value is num) return value.round();
+    return int.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+
+  bool _targetDetected(int distance) {
+    return distance > 0 && distance <= _opponentDetectionDistanceMm;
+  }
+
+  bool _edgeDetected(int value) {
+    return _edgeIsHigh
+        ? value >= _edgeThreshold
+        : value <= _edgeThreshold;
   }
 
   Future<void> _stopAll() async {
@@ -170,14 +278,64 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
     if (isConnected) {
       await _queueCommand('/s');
+      await _fetchStatus();
     }
   }
 
-  void _changeMode(ControlMode newMode) {
-    unawaited(_stopAll());
+  Future<void> _changeMode(ControlMode newMode) async {
+    if (newMode == mode) return;
+
+    if (newMode == ControlMode.manual) {
+      if (isConnected) {
+        await _queueCommand('/auto/stop');
+      }
+
+      if (!mounted) return;
+      setState(() {
+        mode = ControlMode.manual;
+        driveDirection = DriveDirection.stopped;
+        steeringDirection = SteeringDirection.center;
+        _joystickOffset = Offset.zero;
+      });
+      await _fetchStatus();
+      return;
+    }
+
+    await _stopAll();
+
+    if (!mounted) return;
     setState(() {
-      mode = newMode;
+      mode = ControlMode.automatic;
     });
+    await _fetchStatus();
+  }
+
+  Future<void> _startAuto() async {
+    if (!isConnected) return;
+
+    final success = await _queueCommand('/auto/start');
+    if (!success || !mounted) return;
+
+    setState(() {
+      espMode = 'AUTO';
+      robotState = 'SEARCHING';
+    });
+
+    await _fetchStatus();
+  }
+
+  Future<void> _stopAuto() async {
+    if (!isConnected) return;
+
+    final success = await _queueCommand('/auto/stop');
+    if (!success || !mounted) return;
+
+    setState(() {
+      espMode = 'MANUAL';
+      robotState = 'IDLE';
+    });
+
+    await _fetchStatus();
   }
 
   void _updateJoystick(Offset localPosition) {
@@ -254,8 +412,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     final steeringWasReleased = oldSteering != SteeringDirection.center &&
         newSteering == SteeringDirection.center;
 
-    // Current ESP32 firmware only has /s, so if either joystick axis returns
-    // to neutral we stop both motors, then restore the other active axis.
+    // The current firmware still has one shared stop route (/s). If one
+    // joystick axis goes neutral, stop both then restore the remaining axis.
     if (driveWasReleased || steeringWasReleased) {
       final stopped = await _queueCommand('/s');
       if (!stopped || !mounted) return;
@@ -342,7 +500,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             Expanded(
               child: mode == ControlMode.manual
                   ? _buildFixedManualScreen()
-                  : _buildScrollableAutomaticScreen(),
+                  : _buildAutomaticScreen(),
             ),
           ],
         ),
@@ -445,7 +603,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 title: 'MANUAL',
                 icon: Icons.gamepad_rounded,
                 selected: mode == ControlMode.manual,
-                onTap: () => _changeMode(ControlMode.manual),
+                onTap: () => unawaited(_changeMode(ControlMode.manual)),
               ),
             ),
             Expanded(
@@ -453,7 +611,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 title: 'AUTOMATIC',
                 icon: Icons.auto_mode_rounded,
                 selected: mode == ControlMode.automatic,
-                onTap: () => _changeMode(ControlMode.automatic),
+                onTap: () => unawaited(_changeMode(ControlMode.automatic)),
               ),
             ),
           ],
@@ -500,86 +658,81 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  // Manual mode deliberately contains no ScrollView so dragging the joystick
-  // cannot move the page while the robot is being controlled.
+  // Manual mode intentionally has no ScrollView. This keeps the page fixed
+  // while the joystick is dragged.
   Widget _buildFixedManualScreen() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 14),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          return Column(
-            children: [
-              _buildCompactConnectionBar(),
-              const SizedBox(height: 8),
-              Expanded(
-                child: Container(
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF14171C),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.055),
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      const SizedBox(height: 12),
-                      const Text(
-                        'MANUAL JOYSTICK',
-                        style: TextStyle(
-                          color: Colors.white70,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                          letterSpacing: 1.3,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        isConnected
-                            ? 'Drag and hold to control the Sumobot'
-                            : 'Connect to ESP32-ROBOT to enable control',
-                        style: const TextStyle(
-                          color: Colors.white38,
-                          fontSize: 10.5,
-                        ),
-                      ),
-                      const Spacer(),
-                      _buildJoystick(),
-                      const Spacer(),
-                      _buildMovementStatus(),
-                      const SizedBox(height: 12),
-                    ],
-                  ),
+      child: Column(
+        children: [
+          _buildCompactConnectionBar(),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: const Color(0xFF14171C),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.055),
                 ),
               ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                height: 52,
-                child: FilledButton.icon(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xFFD32F2F),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                  ),
-                  onPressed:
-                      isConnected ? () => unawaited(_stopAll()) : null,
-                  icon: const Icon(Icons.stop_circle_outlined),
-                  label: const Text(
-                    'STOP ALL',
+              child: Column(
+                children: [
+                  const SizedBox(height: 12),
+                  const Text(
+                    'MANUAL JOYSTICK',
                     style: TextStyle(
-                      fontSize: 15,
+                      color: Colors.white70,
                       fontWeight: FontWeight.bold,
-                      letterSpacing: 0.8,
+                      fontSize: 12,
+                      letterSpacing: 1.3,
                     ),
                   ),
+                  const SizedBox(height: 4),
+                  Text(
+                    isConnected
+                        ? 'Forward points toward the spare-tire attack side'
+                        : 'Connect to ESP32-ROBOT to enable control',
+                    style: const TextStyle(
+                      color: Colors.white38,
+                      fontSize: 10.5,
+                    ),
+                  ),
+                  const Spacer(),
+                  _buildJoystick(),
+                  const Spacer(),
+                  _buildMovementStatus(),
+                  const SizedBox(height: 12),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            height: 52,
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFD32F2F),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
-            ],
-          );
-        },
+              onPressed: isConnected ? () => unawaited(_stopAll()) : null,
+              icon: const Icon(Icons.stop_circle_outlined),
+              label: const Text(
+                'STOP ALL',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -816,17 +969,25 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _buildScrollableAutomaticScreen() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
-      child: Column(
-        children: [
-          _buildConnectionCard(),
-          const SizedBox(height: 16),
-          _buildAutomaticPlaceholder(),
-          const SizedBox(height: 16),
-          _buildFirmwareStatus(),
-        ],
+  Widget _buildAutomaticScreen() {
+    return RefreshIndicator(
+      onRefresh: _fetchStatus,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+        child: Column(
+          children: [
+            _buildConnectionCard(),
+            const SizedBox(height: 14),
+            _buildAutoControlCard(),
+            const SizedBox(height: 14),
+            _buildOpponentSensorsCard(),
+            const SizedBox(height: 14),
+            _buildEdgeSensorsCard(),
+            const SizedBox(height: 14),
+            _buildAutoLogicCard(),
+          ],
+        ),
       ),
     );
   }
@@ -839,13 +1000,13 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           _sectionHeader(
             icon: Icons.wifi_rounded,
             title: 'ESP32 Connection',
-            subtitle: 'Connect the phone to the ESP32 access point first',
+            subtitle: 'Live data comes from /status',
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 16),
           _infoRow('Wi-Fi', _ssid),
           _infoRow('Password', _password),
           _infoRow('ESP32 IP', '192.168.4.1'),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(12),
@@ -861,7 +1022,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
               ),
             ),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 12),
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
@@ -885,54 +1046,100 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _buildAutomaticPlaceholder() {
+  Widget _buildAutoControlCard() {
+    final autoRunning = espMode == 'AUTO';
+
     return _card(
       child: Column(
         children: [
           _sectionHeader(
             icon: Icons.auto_mode_rounded,
             title: 'Automatic Mode',
-            subtitle: 'Reserved for the autonomous Sumobot firmware',
+            subtitle: 'Acquire → align → center → attack',
           ),
-          const SizedBox(height: 22),
+          const SizedBox(height: 18),
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(18),
+            padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.amber.withValues(alpha: 0.08),
+              color: const Color(0xFF101318),
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
-                color: Colors.amber.withValues(alpha: 0.25),
+                color: _stateColor().withValues(alpha: 0.35),
               ),
             ),
-            child: const Column(
+            child: Column(
               children: [
-                Icon(
-                  Icons.construction_rounded,
-                  color: Colors.amberAccent,
-                  size: 34,
-                ),
-                SizedBox(height: 12),
-                Text(
-                  'NOT YET SUPPORTED BY THE CURRENT ESP32 CODE',
-                  textAlign: TextAlign.center,
+                const Text(
+                  'ROBOT STATE',
                   style: TextStyle(
-                    color: Colors.amberAccent,
+                    color: Colors.white38,
+                    fontSize: 10,
                     fontWeight: FontWeight.bold,
-                    fontSize: 13,
+                    letterSpacing: 1.3,
                   ),
                 ),
-                SizedBox(height: 8),
+                const SizedBox(height: 6),
                 Text(
-                  'Automatic mode will be enabled when the TCRT5000L and VL53L0X logic is added to the ESP32 firmware.',
+                  robotState.replaceAll('_', ' '),
                   textAlign: TextAlign.center,
                   style: TextStyle(
-                    color: Colors.white60,
-                    height: 1.45,
-                    fontSize: 12,
+                    color: _stateColor(),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 21,
+                    letterSpacing: 0.7,
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  'ESP32 mode: $espMode',
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 11,
                   ),
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            height: 52,
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: autoRunning
+                    ? const Color(0xFFD32F2F)
+                    : const Color(0xFF1565C0),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: !isConnected
+                  ? null
+                  : autoRunning
+                      ? () => unawaited(_stopAuto())
+                      : () => unawaited(_startAuto()),
+              icon: Icon(
+                autoRunning ? Icons.stop_rounded : Icons.play_arrow_rounded,
+              ),
+              label: Text(
+                autoRunning ? 'STOP AUTONOMOUS' : 'START AUTONOMOUS',
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            lastStatusUpdate == null
+                ? 'Waiting for sensor status...'
+                : 'Live status updated ${_timeText(lastStatusUpdate!)}',
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 10.5,
             ),
           ),
         ],
@@ -940,43 +1147,340 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _buildFirmwareStatus() {
+  Widget _buildOpponentSensorsCard() {
     return _card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _sectionHeader(
-            icon: Icons.route_rounded,
-            title: 'Current ESP32 Endpoints',
-            subtitle: 'Matches the Arduino WebServer code',
+            icon: Icons.radar_rounded,
+            title: 'Opponent Tracking',
+            subtitle: '3× VL53L0X on the spare-tire attack side',
           ),
           const SizedBox(height: 18),
-          _endpointRow('GET /', 'Connection test / ESP32 web page'),
-          _endpointRow('GET /f', 'Rear drive forward'),
-          _endpointRow('GET /b', 'Rear drive reverse'),
-          _endpointRow('GET /l', 'Steering left'),
-          _endpointRow('GET /r', 'Steering right'),
-          _endpointRow('GET /s', 'Stop both motors'),
-          const Divider(height: 28),
-          const Text(
-            'Current firmware limitation',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: Colors.orangeAccent,
-            ),
+          Row(
+            children: [
+              Expanded(
+                child: _tofTile(
+                  label: 'LEFT',
+                  value: tofLeft,
+                  emphasized: robotState == 'ALIGN_LEFT',
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _tofTile(
+                  label: 'CENTER',
+                  value: tofCenter,
+                  emphasized: robotState == 'ATTACKING',
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _tofTile(
+                  label: 'RIGHT',
+                  value: tofRight,
+                  emphasized: robotState == 'ALIGN_RIGHT',
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 6),
-          const Text(
-            'There is no separate drive-stop or steering-stop endpoint yet. When one joystick axis returns to center, Flutter uses /s and then restores the other active motor.',
-            style: TextStyle(
-              color: Colors.white54,
-              fontSize: 12,
-              height: 1.4,
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF101318),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Text(
+              'Center sensor has priority: once CENTER detects the opponent, the robot straightens and attacks. LEFT/RIGHT are used to align first.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white54,
+                fontSize: 11,
+                height: 1.4,
+              ),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _tofTile({
+    required String label,
+    required int value,
+    required bool emphasized,
+  }) {
+    final detected = _targetDetected(value);
+    final display = value >= 8000 ? '--' : '$value';
+
+    final color = emphasized
+        ? Colors.orangeAccent
+        : detected
+            ? Colors.greenAccent
+            : Colors.white38;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 14),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: emphasized ? 0.13 : 0.07),
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(
+          color: color.withValues(alpha: emphasized ? 0.65 : 0.22),
+        ),
+      ),
+      child: Column(
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontWeight: FontWeight.bold,
+              fontSize: 10,
+              letterSpacing: 0.8,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            display,
+            style: TextStyle(
+              color: detected ? Colors.white : Colors.white54,
+              fontWeight: FontWeight.bold,
+              fontSize: 20,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value >= 8000 ? 'OUT' : 'mm',
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 9,
+            ),
+          ),
+          const SizedBox(height: 7),
+          Text(
+            detected ? 'DETECTED' : 'CLEAR',
+            style: TextStyle(
+              color: detected ? Colors.greenAccent : Colors.white30,
+              fontWeight: FontWeight.bold,
+              fontSize: 9,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEdgeSensorsCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _sectionHeader(
+            icon: Icons.border_outer_rounded,
+            title: 'Ring Edge Sensors',
+            subtitle: '4× TCRT5000L relative to the NEW front',
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              Expanded(
+                child: _edgeTile('FRONT LEFT', edgeFrontLeft),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _edgeTile('FRONT RIGHT', edgeFrontRight),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: _edgeTile('REAR LEFT', edgeRearLeft),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _edgeTile('REAR RIGHT', edgeRearRight),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Current firmware threshold: $_edgeThreshold ADC • Edge priority overrides attack and alignment.',
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 10.5,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _edgeTile(String label, int value) {
+    final edge = _edgeDetected(value);
+    final color = edge ? Colors.redAccent : Colors.greenAccent;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 160),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: color.withValues(alpha: edge ? 0.60 : 0.16),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  label,
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              Text(
+                edge ? 'EDGE' : 'SAFE',
+                style: TextStyle(
+                  color: color,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 9.5,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '$value',
+            style: const TextStyle(
+              fontWeight: FontWeight.bold,
+              fontSize: 19,
+            ),
+          ),
+          const Text(
+            'ADC',
+            style: TextStyle(
+              color: Colors.white30,
+              fontSize: 9,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAutoLogicCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _sectionHeader(
+            icon: Icons.account_tree_rounded,
+            title: 'Autonomous Priority',
+            subtitle: 'Matches the new ESP32 state logic',
+          ),
+          const SizedBox(height: 16),
+          _logicRow('1', 'EDGE', 'Escape immediately', Colors.redAccent),
+          _logicRow('2', 'CENTER', 'Attack straight', Colors.orangeAccent),
+          _logicRow('3', 'LEFT', 'Align left', Colors.lightBlueAccent),
+          _logicRow('4', 'RIGHT', 'Align right', Colors.lightBlueAccent),
+          _logicRow('5', 'NONE', 'Search / sweep', Colors.white54),
+          const Divider(height: 24),
+          const Text(
+            'Current HTTP routes',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
+          ),
+          const SizedBox(height: 8),
+          _endpointRow('/f  /b  /l  /r  /s', 'Manual control'),
+          _endpointRow('/auto/start', 'Start autonomous mode'),
+          _endpointRow('/auto/stop', 'Stop autonomous mode'),
+          _endpointRow('/status', 'Mode, state, ToF and edge readings'),
+        ],
+      ),
+    );
+  }
+
+  Widget _logicRow(
+    String number,
+    String condition,
+    String action,
+    Color color,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Container(
+            width: 25,
+            height: 25,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.12),
+              shape: BoxShape.circle,
+            ),
+            child: Text(
+              number,
+              style: TextStyle(
+                color: color,
+                fontWeight: FontWeight.bold,
+                fontSize: 11,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 60,
+            child: Text(
+              condition,
+              style: TextStyle(
+                color: color,
+                fontWeight: FontWeight.bold,
+                fontSize: 11,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              action,
+              style: const TextStyle(
+                color: Colors.white60,
+                fontSize: 11,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Color _stateColor() {
+    return switch (robotState) {
+      'ATTACKING' => Colors.redAccent,
+      'EDGE_ESCAPE' => Colors.orangeAccent,
+      'ALIGN_LEFT' || 'ALIGN_RIGHT' => Colors.lightBlueAccent,
+      'SEARCHING' => Colors.amberAccent,
+      _ => Colors.white54,
+    };
+  }
+
+  String _timeText(DateTime time) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${two(time.hour)}:${two(time.minute)}:${two(time.second)}';
   }
 
   Widget _sectionHeader({
@@ -1056,18 +1560,18 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
   Widget _endpointRow(String endpoint, String description) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 76,
+            width: 112,
             child: Text(
               endpoint,
               style: const TextStyle(
                 color: Colors.lightBlueAccent,
                 fontWeight: FontWeight.bold,
-                fontSize: 12,
+                fontSize: 10.5,
               ),
             ),
           ),
@@ -1075,8 +1579,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             child: Text(
               description,
               style: const TextStyle(
-                color: Colors.white60,
-                fontSize: 12,
+                color: Colors.white54,
+                fontSize: 10.5,
               ),
             ),
           ),
