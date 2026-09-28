@@ -46,15 +46,21 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   static const String _password = '12345678';
   static const String _baseUrl = 'http://192.168.4.1';
 
+  static const double _joystickSize = 220;
+  static const double _joystickKnobSize = 72;
+  static const double _joystickDeadZone = 24;
+
   ControlMode mode = ControlMode.manual;
   DriveDirection driveDirection = DriveDirection.stopped;
   SteeringDirection steeringDirection = SteeringDirection.center;
 
   bool isConnected = false;
   bool isCheckingConnection = false;
-  String connectionMessage = 'Connect to ESP32-ROBOT, then test the connection.';
+  String connectionMessage =
+      'Connect to ESP32-ROBOT, then test the connection.';
   String lastCommand = 'NONE';
 
+  Offset _joystickOffset = Offset.zero;
   Future<void> _commandTail = Future<void>.value();
 
   @override
@@ -201,8 +207,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   }
 
   Future<void> _stopThenRestoreActiveMotor() async {
-    // The current Arduino firmware only has /s, which stops BOTH motors.
-    // After stopping, re-send whichever other control is still being held.
     final stopped = await _queueCommand('/s');
     if (!stopped || !mounted) return;
 
@@ -220,10 +224,13 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   }
 
   Future<void> _stopAll() async {
-    setState(() {
-      driveDirection = DriveDirection.stopped;
-      steeringDirection = SteeringDirection.center;
-    });
+    if (mounted) {
+      setState(() {
+        driveDirection = DriveDirection.stopped;
+        steeringDirection = SteeringDirection.center;
+        _joystickOffset = Offset.zero;
+      });
+    }
 
     if (isConnected) {
       await _queueCommand('/s');
@@ -237,6 +244,119 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     });
   }
 
+  void _updateJoystick(Offset localPosition) {
+    if (!isConnected || mode != ControlMode.manual) return;
+
+    const center = Offset(_joystickSize / 2, _joystickSize / 2);
+    const maxTravel = (_joystickSize - _joystickKnobSize) / 2;
+
+    var offset = localPosition - center;
+    final distance = offset.distance;
+
+    if (distance > maxTravel && distance > 0) {
+      offset = offset * (maxTravel / distance);
+    }
+
+    final newDrive = offset.dy < -_joystickDeadZone
+        ? DriveDirection.forward
+        : offset.dy > _joystickDeadZone
+            ? DriveDirection.reverse
+            : DriveDirection.stopped;
+
+    final newSteering = offset.dx < -_joystickDeadZone
+        ? SteeringDirection.left
+        : offset.dx > _joystickDeadZone
+            ? SteeringDirection.right
+            : SteeringDirection.center;
+
+    final oldDrive = driveDirection;
+    final oldSteering = steeringDirection;
+
+    setState(() {
+      _joystickOffset = offset;
+      driveDirection = newDrive;
+      steeringDirection = newSteering;
+    });
+
+    if (oldDrive != newDrive || oldSteering != newSteering) {
+      unawaited(
+        _sendJoystickTransition(
+          oldDrive: oldDrive,
+          oldSteering: oldSteering,
+          newDrive: newDrive,
+          newSteering: newSteering,
+        ),
+      );
+    }
+  }
+
+  void _releaseJoystick() {
+    if (mode != ControlMode.manual) return;
+
+    final oldDrive = driveDirection;
+    final oldSteering = steeringDirection;
+
+    setState(() {
+      _joystickOffset = Offset.zero;
+      driveDirection = DriveDirection.stopped;
+      steeringDirection = SteeringDirection.center;
+    });
+
+    if (isConnected &&
+        (oldDrive != DriveDirection.stopped ||
+            oldSteering != SteeringDirection.center)) {
+      unawaited(_queueCommand('/s'));
+    }
+  }
+
+  Future<void> _sendJoystickTransition({
+    required DriveDirection oldDrive,
+    required SteeringDirection oldSteering,
+    required DriveDirection newDrive,
+    required SteeringDirection newSteering,
+  }) async {
+    final driveWasReleased = oldDrive != DriveDirection.stopped &&
+        newDrive == DriveDirection.stopped;
+    final steeringWasReleased = oldSteering != SteeringDirection.center &&
+        newSteering == SteeringDirection.center;
+
+    // Current firmware has only /s, which stops both motors. If either axis
+    // returns to neutral, stop both and then restore the other active axis.
+    if (driveWasReleased || steeringWasReleased) {
+      final stopped = await _queueCommand('/s');
+      if (!stopped || !mounted) return;
+
+      if (newDrive == DriveDirection.forward) {
+        await _queueCommand('/f');
+      } else if (newDrive == DriveDirection.reverse) {
+        await _queueCommand('/b');
+      }
+
+      if (newSteering == SteeringDirection.left) {
+        await _queueCommand('/l');
+      } else if (newSteering == SteeringDirection.right) {
+        await _queueCommand('/r');
+      }
+      return;
+    }
+
+    if (newDrive != oldDrive) {
+      if (newDrive == DriveDirection.forward) {
+        await _queueCommand('/f');
+      } else if (newDrive == DriveDirection.reverse) {
+        await _queueCommand('/b');
+      }
+    }
+
+    if (newSteering != oldSteering) {
+      if (newSteering == SteeringDirection.left) {
+        await _queueCommand('/l');
+      } else if (newSteering == SteeringDirection.right) {
+        await _queueCommand('/r');
+      }
+    }
+  }
+
   String get driveText => switch (driveDirection) {
         DriveDirection.forward => 'FORWARD',
         DriveDirection.reverse => 'REVERSE',
@@ -248,6 +368,34 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         SteeringDirection.right => 'RIGHT',
         SteeringDirection.center => 'CENTER',
       };
+
+  String get movementText {
+    if (driveDirection == DriveDirection.stopped &&
+        steeringDirection == SteeringDirection.center) {
+      return 'STOPPED';
+    }
+
+    if (driveDirection == DriveDirection.forward &&
+        steeringDirection == SteeringDirection.left) {
+      return 'FORWARD LEFT';
+    }
+    if (driveDirection == DriveDirection.forward &&
+        steeringDirection == SteeringDirection.right) {
+      return 'FORWARD RIGHT';
+    }
+    if (driveDirection == DriveDirection.reverse &&
+        steeringDirection == SteeringDirection.left) {
+      return 'REVERSE LEFT';
+    }
+    if (driveDirection == DriveDirection.reverse &&
+        steeringDirection == SteeringDirection.right) {
+      return 'REVERSE RIGHT';
+    }
+    if (driveDirection == DriveDirection.forward) return 'FORWARD';
+    if (driveDirection == DriveDirection.reverse) return 'REVERSE';
+    if (steeringDirection == SteeringDirection.left) return 'LEFT';
+    return 'RIGHT';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -493,10 +641,61 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             icon: Icons.gamepad_rounded,
             title: 'Manual Control',
             subtitle: isConnected
-                ? 'Commands are sent directly to the ESP32'
+                ? 'Use the joystick or backup buttons below'
                 : 'Connect to the ESP32 before using the controls',
           ),
+          const SizedBox(height: 24),
+          _buildJoystick(),
+          const SizedBox(height: 22),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF101318),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              children: [
+                Text(
+                  movementText,
+                  style: TextStyle(
+                    color: isConnected ? Colors.lightBlueAccent : Colors.white38,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Drive: $driveText  •  Steering: $steeringText',
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ),
           const SizedBox(height: 26),
+          const Row(
+            children: [
+              Expanded(child: Divider()),
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  'BACKUP BUTTONS',
+                  style: TextStyle(
+                    color: Colors.white38,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ),
+              Expanded(child: Divider()),
+            ],
+          ),
+          const SizedBox(height: 20),
           _holdButton(
             icon: Icons.keyboard_arrow_up_rounded,
             label: 'FORWARD',
@@ -596,6 +795,151 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
+  Widget _buildJoystick() {
+    return Column(
+      children: [
+        const Text(
+          'JOYSTICK',
+          style: TextStyle(
+            color: Colors.white70,
+            fontWeight: FontWeight.bold,
+            fontSize: 12,
+            letterSpacing: 1.4,
+          ),
+        ),
+        const SizedBox(height: 12),
+        AnimatedOpacity(
+          duration: const Duration(milliseconds: 120),
+          opacity: isConnected ? 1 : 0.35,
+          child: SizedBox(
+            width: _joystickSize,
+            height: _joystickSize,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onPanDown: isConnected
+                  ? (details) => _updateJoystick(details.localPosition)
+                  : null,
+              onPanUpdate: isConnected
+                  ? (details) => _updateJoystick(details.localPosition)
+                  : null,
+              onPanEnd: isConnected ? (_) => _releaseJoystick() : null,
+              onPanCancel: isConnected ? _releaseJoystick : null,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: _joystickSize,
+                    height: _joystickSize,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: const Color(0xFF101318),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.10),
+                        width: 2,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.25),
+                          blurRadius: 18,
+                          spreadRadius: 3,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Positioned(
+                    top: 14,
+                    child: Icon(
+                      Icons.keyboard_arrow_up_rounded,
+                      color: Colors.white30,
+                      size: 32,
+                    ),
+                  ),
+                  const Positioned(
+                    bottom: 14,
+                    child: Icon(
+                      Icons.keyboard_arrow_down_rounded,
+                      color: Colors.white30,
+                      size: 32,
+                    ),
+                  ),
+                  const Positioned(
+                    left: 14,
+                    child: Icon(
+                      Icons.keyboard_arrow_left_rounded,
+                      color: Colors.white30,
+                      size: 32,
+                    ),
+                  ),
+                  const Positioned(
+                    right: 14,
+                    child: Icon(
+                      Icons.keyboard_arrow_right_rounded,
+                      color: Colors.white30,
+                      size: 32,
+                    ),
+                  ),
+                  Container(
+                    width: 74,
+                    height: 74,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.05),
+                      ),
+                    ),
+                  ),
+                  Transform.translate(
+                    offset: _joystickOffset,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 45),
+                      width: _joystickKnobSize,
+                      height: _joystickKnobSize,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [Color(0xFF42A5F5), Color(0xFF1565C0)],
+                        ),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.18),
+                          width: 2,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF1976D2)
+                                .withValues(alpha: 0.35),
+                            blurRadius: 18,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(
+                        Icons.control_camera_rounded,
+                        color: Colors.white,
+                        size: 30,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'Up/Down = drive  •  Left/Right = steer\nDiagonal movement controls both motors together.',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Colors.white38,
+            fontSize: 10.5,
+            height: 1.45,
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildAutomaticPlaceholder() {
     return _card(
       child: Column(
@@ -670,6 +1014,23 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           _endpointRow('GET /s', 'Stop both motors'),
           const Divider(height: 28),
           const Text(
+            'Joystick behavior',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: Colors.lightBlueAccent,
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'The joystick uses the same /f, /b, /l, /r and /s routes. Diagonal positions send one drive command and one steering command.',
+            style: TextStyle(
+              color: Colors.white54,
+              fontSize: 12,
+              height: 1.4,
+            ),
+          ),
+          const Divider(height: 28),
+          const Text(
             'Current firmware limitation',
             style: TextStyle(
               fontWeight: FontWeight.bold,
@@ -678,7 +1039,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           ),
           const SizedBox(height: 6),
           const Text(
-            'There is no separate drive-stop or steering-stop endpoint yet. Flutter uses /s and then restores the other control if it is still being held.',
+            'There is no separate drive-stop or steering-stop endpoint yet. When one joystick axis returns to center, Flutter uses /s and then restores the other active motor.',
             style: TextStyle(
               color: Colors.white54,
               fontSize: 12,
