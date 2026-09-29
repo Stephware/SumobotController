@@ -48,7 +48,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   static const String _baseUrl = 'http://192.168.4.1';
 
   // Matches the current 2-VL53 Arduino logic.
-  static const int _enemyDistanceMm = 200;
+  static const int _enemyDistanceMm = 600;
   static const int _noDetectionMm = 8190;
 
   static const double _joystickSize = 220;
