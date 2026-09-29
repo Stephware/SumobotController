@@ -44,12 +44,14 @@ class SumobotControllerPage extends StatefulWidget {
 
 class _SumobotControllerPageState extends State<SumobotControllerPage> {
   static const String _ssid = 'ESP32-ROBOT';
-  static const String _password = '12345678';
   static const String _baseUrl = 'http://192.168.4.1';
 
-  // Matches the current 2-VL53 Arduino logic.
+  // Current opponent-sensor configuration.
   static const int _enemyDistanceMm = 600;
   static const int _noDetectionMm = 8190;
+
+  // A negative value means the ESP32 has not supplied a TCRT reading yet.
+  static const int _unknownEdgeValue = -1;
 
   static const double _joystickSize = 220;
   static const double _joystickKnobSize = 72;
@@ -70,9 +72,17 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   String espMode = 'MANUAL';
   String robotState = 'IDLE';
 
+  // 2 x VL53L0X opponent sensors.
   int tofNW = _noDetectionMm;
   int tofNE = _noDetectionMm;
   bool opponentLocated = false;
+
+  // 2 x TCRT5000L boundary sensors.
+  // These are treated as FRONT LEFT and FRONT RIGHT.
+  int edgeFrontLeft = _unknownEdgeValue;
+  int edgeFrontRight = _unknownEdgeValue;
+  bool edgeFrontLeftDetected = false;
+  bool edgeFrontRightDetected = false;
 
   DateTime? lastStatusUpdate;
 
@@ -215,21 +225,64 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
       final tof = decoded['tof'];
 
+      // Support either "edge" or "tcrt" as the firmware object name.
+      final dynamic edgeData = decoded['edge'] ?? decoded['tcrt'];
+      final dynamic edgeDetectedData = decoded['edgeDetected'];
+
       setState(() {
         espMode = decoded['mode']?.toString() ?? espMode;
         robotState = decoded['state']?.toString() ?? robotState;
         opponentLocated = _asBool(decoded['opponentLocated'], opponentLocated);
 
         if (tof is Map<String, dynamic>) {
-          // Preferred keys for the current firmware.
           tofNW = _asInt(tof['nw'] ?? tof['left'], tofNW);
           tofNE = _asInt(tof['ne'] ?? tof['right'], tofNE);
+        }
+
+        if (edgeData is Map<String, dynamic>) {
+          edgeFrontLeft = _asInt(
+            edgeData['frontLeft'] ?? edgeData['fl'] ?? edgeData['left'],
+            edgeFrontLeft,
+          );
+          edgeFrontRight = _asInt(
+            edgeData['frontRight'] ?? edgeData['fr'] ?? edgeData['right'],
+            edgeFrontRight,
+          );
+
+          edgeFrontLeftDetected = _asBool(
+            edgeData['frontLeftDetected'] ??
+                edgeData['flDetected'] ??
+                edgeData['leftDetected'],
+            edgeFrontLeftDetected,
+          );
+          edgeFrontRightDetected = _asBool(
+            edgeData['frontRightDetected'] ??
+                edgeData['frDetected'] ??
+                edgeData['rightDetected'],
+            edgeFrontRightDetected,
+          );
+        }
+
+        // Also support firmware that sends detection booleans separately.
+        if (edgeDetectedData is Map<String, dynamic>) {
+          edgeFrontLeftDetected = _asBool(
+            edgeDetectedData['frontLeft'] ??
+                edgeDetectedData['fl'] ??
+                edgeDetectedData['left'],
+            edgeFrontLeftDetected,
+          );
+          edgeFrontRightDetected = _asBool(
+            edgeDetectedData['frontRight'] ??
+                edgeDetectedData['fr'] ??
+                edgeDetectedData['right'],
+            edgeFrontRightDetected,
+          );
         }
 
         lastStatusUpdate = DateTime.now();
       });
     } catch (_) {
-      // Keep the last valid values when a status response is incomplete.
+      // Keep the most recent valid values when a response is incomplete.
     } finally {
       _statusRequestInFlight = false;
     }
@@ -251,6 +304,9 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   bool _targetDetected(int distance) {
     return distance > 0 && distance <= _enemyDistanceMm;
   }
+
+  bool get _anyEdgeDetected =>
+      edgeFrontLeftDetected || edgeFrontRightDetected;
 
   Future<void> _stopAll() async {
     if (mounted) {
@@ -323,7 +379,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     await _fetchStatus();
   }
 
-  // Chassis is physically reversed relative to the old RC orientation.
+  // The chassis is physically reversed relative to the original RC car.
   String? _driveEndpoint(DriveDirection direction) {
     return switch (direction) {
       DriveDirection.forward => '/b',
@@ -340,7 +396,6 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     };
   }
 
-  // Combined diagonal endpoints, with both physical axes inverted.
   String? _diagonalEndpoint(
     DriveDirection drive,
     SteeringDirection steering,
@@ -559,7 +614,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   ),
                 ),
                 Text(
-                  '2-Sensor Autonomous Test',
+                  '2× VL53L0X + 2× TCRT5000L',
                   style: TextStyle(color: Colors.white54, fontSize: 11),
                 ),
               ],
@@ -674,6 +729,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         children: [
           _buildConnectionBar(),
           const SizedBox(height: 8),
+          _buildTcrtStrip(),
+          const SizedBox(height: 8),
           Expanded(
             child: Container(
               width: double.infinity,
@@ -696,7 +753,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   ),
                   const SizedBox(height: 4),
                   const Text(
-                    'F / B / L / R + FL / FR / RL / RR endpoints',
+                    'TCRT status remains visible while you drive manually',
                     style: TextStyle(color: Colors.white38, fontSize: 10.5),
                   ),
                   const Spacer(),
@@ -762,6 +819,83 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildTcrtStrip() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: _anyEdgeDetected
+            ? Colors.redAccent.withValues(alpha: 0.10)
+            : const Color(0xFF14171C),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: _anyEdgeDetected
+              ? Colors.redAccent.withValues(alpha: 0.45)
+              : Colors.white.withValues(alpha: 0.055),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.border_outer_rounded,
+            size: 19,
+            color: _anyEdgeDetected ? Colors.redAccent : Colors.white38,
+          ),
+          const SizedBox(width: 9),
+          const Text(
+            'TCRT',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: _miniEdgeStatus(
+              'FL',
+              edgeFrontLeft,
+              edgeFrontLeftDetected,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _miniEdgeStatus(
+              'FR',
+              edgeFrontRight,
+              edgeFrontRightDetected,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _miniEdgeStatus(String label, int value, bool detected) {
+    final known = value >= 0;
+    final color = detected
+        ? Colors.redAccent
+        : known
+            ? Colors.greenAccent
+            : Colors.white30;
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          label,
+          style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 10),
+        ),
+        const SizedBox(width: 5),
+        Text(
+          known ? '$value' : '--',
+          style: const TextStyle(fontSize: 10, color: Colors.white60),
+        ),
+        const SizedBox(width: 5),
+        Text(
+          detected ? 'EDGE' : (known ? 'SAFE' : 'WAIT'),
+          style: TextStyle(color: color, fontSize: 9, fontWeight: FontWeight.bold),
+        ),
+      ],
     );
   }
 
@@ -835,19 +969,23 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
               ),
               const Positioned(
                 top: 14,
-                child: Icon(Icons.keyboard_arrow_up_rounded, color: Colors.white30, size: 32),
+                child: Icon(Icons.keyboard_arrow_up_rounded,
+                    color: Colors.white30, size: 32),
               ),
               const Positioned(
                 bottom: 14,
-                child: Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white30, size: 32),
+                child: Icon(Icons.keyboard_arrow_down_rounded,
+                    color: Colors.white30, size: 32),
               ),
               const Positioned(
                 left: 14,
-                child: Icon(Icons.keyboard_arrow_left_rounded, color: Colors.white30, size: 32),
+                child: Icon(Icons.keyboard_arrow_left_rounded,
+                    color: Colors.white30, size: 32),
               ),
               const Positioned(
                 right: 14,
-                child: Icon(Icons.keyboard_arrow_right_rounded, color: Colors.white30, size: 32),
+                child: Icon(Icons.keyboard_arrow_right_rounded,
+                    color: Colors.white30, size: 32),
               ),
               Transform.translate(
                 offset: _joystickOffset,
@@ -890,7 +1028,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   _sectionHeader(
                     Icons.auto_mode_rounded,
                     'Autonomous Test',
-                    'Two VL53L0X opponent-tracking stage',
+                    'Opponent tracking + TCRT boundary monitoring',
                   ),
                   const SizedBox(height: 16),
                   Container(
@@ -899,7 +1037,9 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                     decoration: BoxDecoration(
                       color: const Color(0xFF101318),
                       borderRadius: BorderRadius.circular(14),
-                      border: Border.all(color: _stateColor().withValues(alpha: 0.4)),
+                      border: Border.all(
+                        color: _stateColor().withValues(alpha: 0.4),
+                      ),
                     ),
                     child: Column(
                       children: [
@@ -918,8 +1058,18 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          'Opponent located: ${opponentLocated ? 'YES' : 'NO'}',
-                          style: const TextStyle(color: Colors.white54, fontSize: 11),
+                          _anyEdgeDetected
+                              ? 'BOUNDARY DETECTED'
+                              : 'Opponent located: ${opponentLocated ? 'YES' : 'NO'}',
+                          style: TextStyle(
+                            color: _anyEdgeDetected
+                                ? Colors.redAccent
+                                : Colors.white54,
+                            fontSize: 11,
+                            fontWeight: _anyEdgeDetected
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                          ),
                         ),
                       ],
                     ),
@@ -962,17 +1112,17 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   _sectionHeader(
                     Icons.radar_rounded,
                     'VL53L0X Sensors',
-                    'Detection threshold: $_enemyDistanceMm mm',
+                    'Opponent threshold: $_enemyDistanceMm mm',
                   ),
                   const SizedBox(height: 18),
                   Row(
                     children: [
                       Expanded(
-                        child: _sensorTile('NW / LEFT', tofNW, nwDetected),
+                        child: _tofSensorTile('NW / LEFT', tofNW, nwDetected),
                       ),
                       const SizedBox(width: 10),
                       Expanded(
-                        child: _sensorTile('NE / RIGHT', tofNE, neDetected),
+                        child: _tofSensorTile('NE / RIGHT', tofNE, neDetected),
                       ),
                     ],
                   ),
@@ -987,26 +1137,84 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _sectionHeader(
+                    Icons.border_outer_rounded,
+                    'TCRT5000L Edge Sensors',
+                    'Front-left and front-right boundary detection',
+                  ),
+                  const SizedBox(height: 18),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _edgeSensorTile(
+                          'FRONT LEFT',
+                          edgeFrontLeft,
+                          edgeFrontLeftDetected,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _edgeSensorTile(
+                          'FRONT RIGHT',
+                          edgeFrontRight,
+                          edgeFrontRightDetected,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: (_anyEdgeDetected
+                              ? Colors.redAccent
+                              : Colors.greenAccent)
+                          .withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      _anyEdgeDetected
+                          ? 'EDGE PRIORITY: the ESP32 should override search / align / attack and perform its escape routine.'
+                          : 'EDGE STATUS: clear. Normal search / align / attack logic may continue.',
+                      style: TextStyle(
+                        color: _anyEdgeDetected
+                            ? Colors.redAccent
+                            : Colors.greenAccent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            _card(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _sectionHeader(
                     Icons.account_tree_rounded,
-                    'Current Autonomous Logic',
-                    'TCRT edge detection is intentionally not added yet',
+                    'Autonomous Priority',
+                    'Boundary safety takes priority over opponent tracking',
                   ),
                   const SizedBox(height: 14),
+                  _logicRow('TCRT edge', 'EDGE ESCAPE • highest priority'),
                   _logicRow('NW + NE', 'ATTACK straight'),
-                  _logicRow('NW only', 'ALIGN • right steering correction'),
-                  _logicRow('NE only', 'ALIGN • left steering correction'),
-                  _logicRow('Neither', 'SEARCH / stop after target was previously found'),
+                  _logicRow('NW only', 'ALIGN toward opponent'),
+                  _logicRow('NE only', 'ALIGN toward opponent'),
+                  _logicRow('Neither', 'SEARCH'),
                   const Divider(height: 24),
                   const Text(
-                    'Expected API for Flutter test',
+                    'Status API',
                     style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
                   ),
                   const SizedBox(height: 8),
+                  _endpointRow('/status', 'Mode, state, VL53 and TCRT values'),
                   _endpointRow('/auto/start', 'Start autonomous state machine'),
-                  _endpointRow('/auto/stop', 'Stop autonomous mode'),
-                  _endpointRow('/status', 'Return mode, state, NW and NE distances'),
-                  _endpointRow('/f /b /l /r /s', 'Single-axis manual control'),
-                  _endpointRow('/fl /fr /rl /rr', 'Combined diagonal control'),
+                  _endpointRow('/auto/stop', 'Stop autonomous state machine'),
+                  _endpointRow('/f /b /l /r /s', 'Manual single-axis controls'),
+                  _endpointRow('/fl /fr /rl /rr', 'Manual diagonal controls'),
                 ],
               ),
             ),
@@ -1023,7 +1231,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _sensorTile(String label, int value, bool detected) {
+  Widget _tofSensorTile(String label, int value, bool detected) {
     final display = value >= 8000 ? '--' : '$value';
     final color = detected ? Colors.greenAccent : Colors.white38;
 
@@ -1067,26 +1275,78 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
+  Widget _edgeSensorTile(String label, int value, bool detected) {
+    final known = value >= 0;
+    final color = detected
+        ? Colors.redAccent
+        : known
+            ? Colors.greenAccent
+            : Colors.white38;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: color.withValues(alpha: 0.30)),
+      ),
+      child: Column(
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontWeight: FontWeight.bold,
+              fontSize: 10,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            known ? '$value' : '--',
+            style: const TextStyle(fontSize: 23, fontWeight: FontWeight.bold),
+          ),
+          const Text(
+            'ADC',
+            style: TextStyle(color: Colors.white38, fontSize: 9),
+          ),
+          const SizedBox(height: 7),
+          Text(
+            detected ? 'EDGE' : (known ? 'SAFE' : 'WAITING'),
+            style: TextStyle(
+              color: color,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _decisionBox(bool nw, bool ne) {
     late final String title;
     late final String detail;
     late final Color color;
 
-    if (nw && ne) {
+    if (_anyEdgeDetected) {
+      title = 'EDGE ESCAPE';
+      detail = 'TCRT boundary detection overrides the VL53 opponent decision.';
+      color = Colors.redAccent;
+    } else if (nw && ne) {
       title = 'ATTACK';
-      detail = 'Both sensors see the opponent → centered enough to charge.';
+      detail = 'Both VL53 sensors see the opponent.';
       color = Colors.redAccent;
     } else if (nw) {
       title = 'ALIGNING';
-      detail = 'NW only → opponent is on the left → apply right correction.';
+      detail = 'Left opponent sensor only.';
       color = Colors.lightBlueAccent;
     } else if (ne) {
       title = 'ALIGNING';
-      detail = 'NE only → opponent is on the right → apply left correction.';
+      detail = 'Right opponent sensor only.';
       color = Colors.lightBlueAccent;
     } else {
       title = 'SEARCHING';
-      detail = 'Neither sensor detects an opponent within $_enemyDistanceMm mm.';
+      detail = 'No opponent detected within $_enemyDistanceMm mm.';
       color = Colors.amberAccent;
     }
 
@@ -1100,9 +1360,15 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: TextStyle(color: color, fontWeight: FontWeight.bold)),
+          Text(
+            title,
+            style: TextStyle(color: color, fontWeight: FontWeight.bold),
+          ),
           const SizedBox(height: 4),
-          Text(detail, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+          Text(
+            detail,
+            style: const TextStyle(color: Colors.white54, fontSize: 11),
+          ),
         ],
       ),
     );
@@ -1114,7 +1380,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       child: Row(
         children: [
           SizedBox(
-            width: 82,
+            width: 88,
             child: Text(
               condition,
               style: const TextStyle(
@@ -1180,9 +1446,15 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              Text(
+                title,
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 2),
-              Text(subtitle, style: const TextStyle(color: Colors.white38, fontSize: 11)),
+              Text(
+                subtitle,
+                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              ),
             ],
           ),
         ),
@@ -1191,6 +1463,11 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   }
 
   Color _stateColor() {
+    if (robotState == 'EDGE_ESCAPE' ||
+        robotState == 'ESCAPING' ||
+        robotState == 'EDGE ESCAPE') {
+      return Colors.purpleAccent;
+    }
     if (robotState == 'ATTACKING') return Colors.redAccent;
     if (robotState == 'ALIGNING') return Colors.lightBlueAccent;
     if (robotState == 'SEARCHING') return Colors.amberAccent;
