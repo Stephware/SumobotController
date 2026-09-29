@@ -4,9 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
-void main() {
-  runApp(const SumobotApp());
-}
+void main() => runApp(const SumobotApp());
 
 class SumobotApp extends StatelessWidget {
   const SumobotApp({super.key});
@@ -49,12 +47,20 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   // Must match the current Arduino firmware.
   static const int _enemyDistanceMm = 200;
   static const int _noDetectionMm = 8190;
-  static const int _unknownEdgeValue = -1;
+  static const int _unknownAdc = -1;
   static const int _tcrtDangerThreshold = 3000;
+
   static const int _searchDrivePercent = 30;
-  static const int _attackDrivePercent = 100;
-  static const int _searchSweepMs = 1000;
+  static const int _searchSweepMs = 1600;
   static const int _alignConfirmMs = 140;
+  static const int _attackDrivePercent = 100;
+
+  static const int _edgeMinRetreatMs = 320;
+  static const int _edgeMaxRetreatMs = 650;
+  static const int _edgeTurnMs = 850;
+  static const int _edgeSettleMs = 140;
+  static const int _edgeRetreatPwm = 255;
+  static const int _edgeTurnPwm = 115;
 
   static const double _joystickSize = 220;
   static const double _joystickKnobSize = 72;
@@ -71,22 +77,21 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   String connectionMessage =
       'Connect to ESP32-ROBOT, then test the connection.';
   String lastCommand = 'NONE';
-
   String espMode = 'MANUAL';
   String robotState = 'IDLE';
   String autoAction = 'IDLE';
 
-  // One centered VL53L0X.
+  // One CENTER VL53L0X.
   int tofCenter = _noDetectionMm;
   bool tofDetected = false;
   bool opponentLocated = false;
   bool vl53Ready = false;
 
-  // Two TCRT5000L sensors: FRONT and BACK.
-  int tcrtFront = _unknownEdgeValue;
-  int tcrtBack = _unknownEdgeValue;
-  bool frontEdgeDetected = false;
-  bool backEdgeDetected = false;
+  // FRONT and BACK TCRT5000L.
+  int tcrtFront = _unknownAdc;
+  int tcrtBack = _unknownAdc;
+  bool frontEdgeConfirmed = false;
+  bool backEdgeConfirmed = false;
 
   DateTime? lastStatusUpdate;
 
@@ -94,16 +99,29 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   Future<void> _commandTail = Future<void>.value();
   Timer? _statusTimer;
 
+  bool get _frontDangerNow =>
+      tcrtFront >= 0 && tcrtFront >= _tcrtDangerThreshold;
+
+  bool get _backDangerNow =>
+      tcrtBack >= 0 && tcrtBack >= _tcrtDangerThreshold;
+
+  bool get _anyDangerNow => _frontDangerNow || _backDangerNow;
+
+  bool get _manualSafetyStop =>
+      mode == ControlMode.manual && autoAction == 'MANUAL_EDGE_STOP';
+
+  bool get _edgeRecoveryActive => robotState == 'EDGE_ESCAPE';
+
+  int get _edgeTurnPercent => ((_edgeTurnPwm / 255) * 100).round();
+
   @override
   void initState() {
     super.initState();
 
     _statusTimer = Timer.periodic(
-      const Duration(milliseconds: 400),
+      const Duration(milliseconds: 350),
       (_) {
-        if (isConnected) {
-          unawaited(_fetchStatus());
-        }
+        if (isConnected) unawaited(_fetchStatus());
       },
     );
 
@@ -147,9 +165,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 : 'ESP32 responded with HTTP ${response.statusCode}.';
           }
 
-          if (success && updateCommand) {
-            lastCommand = path;
-          }
+          if (success && updateCommand) lastCommand = path;
         });
       }
 
@@ -173,9 +189,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
     _commandTail = _commandTail.then((_) async {
       final body = await _get(path, updateCommand: true);
-      if (!completer.isCompleted) {
-        completer.complete(body != null);
-      }
+      if (!completer.isCompleted) completer.complete(body != null);
     });
 
     return completer.future;
@@ -189,18 +203,13 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       connectionMessage = 'Checking ESP32 connection...';
     });
 
-    final body = await _get('/');
-    final success = body != null;
+    final success = await _get('/') != null;
 
     if (!mounted) return;
 
-    setState(() {
-      isCheckingConnection = false;
-    });
+    setState(() => isCheckingConnection = false);
 
-    if (success) {
-      await _fetchStatus();
-    }
+    if (success) await _fetchStatus();
 
     if (showFeedback && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -255,13 +264,13 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         if (tcrtData is Map<String, dynamic>) {
           tcrtFront = _asInt(tcrtData['front'], tcrtFront);
           tcrtBack = _asInt(tcrtData['back'], tcrtBack);
-          frontEdgeDetected = _asBool(
+          frontEdgeConfirmed = _asBool(
             tcrtData['frontDetected'],
-            frontEdgeDetected,
+            frontEdgeConfirmed,
           );
-          backEdgeDetected = _asBool(
+          backEdgeConfirmed = _asBool(
             tcrtData['backDetected'],
-            backEdgeDetected,
+            backEdgeConfirmed,
           );
         }
 
@@ -269,9 +278,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           vl53Ready = _asBool(healthData['vl53'], vl53Ready);
         }
 
-        // The Arduino immediately stops both motors in MANUAL mode when its
-        // raw TCRT reading reaches BLACK / DANGER. Keep the joystick display
-        // synchronized with that real motor state.
+        // The Arduino stops both motors immediately in MANUAL mode whenever
+        // either raw TCRT value reaches BLACK / DANGER.
         if (newAutoAction == 'MANUAL_EDGE_STOP') {
           driveDirection = DriveDirection.stopped;
           steeringDirection = SteeringDirection.center;
@@ -281,7 +289,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         lastStatusUpdate = DateTime.now();
       });
     } catch (_) {
-      // Keep the latest valid values if a response is incomplete.
+      // Keep the most recent valid status if one response is incomplete.
     } finally {
       _statusRequestInFlight = false;
     }
@@ -295,19 +303,15 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
 
   bool _asBool(dynamic value, bool fallback) {
     if (value is bool) return value;
-    if (value?.toString().toLowerCase() == 'true') return true;
-    if (value?.toString().toLowerCase() == 'false') return false;
+    final text = value?.toString().toLowerCase();
+    if (text == 'true') return true;
+    if (text == 'false') return false;
     return fallback;
   }
 
   bool _targetDetected(int distance) {
     return distance > 0 && distance <= _enemyDistanceMm;
   }
-
-  bool get _anyEdgeDetected => frontEdgeDetected || backEdgeDetected;
-
-  bool get _manualSafetyStop =>
-      mode == ControlMode.manual && autoAction == 'MANUAL_EDGE_STOP';
 
   Future<void> _stopAll() async {
     if (mounted) {
@@ -328,9 +332,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     if (newMode == mode) return;
 
     if (newMode == ControlMode.manual) {
-      if (isConnected) {
-        await _queueCommand('/auto/stop');
-      }
+      if (isConnected) await _queueCommand('/auto/stop');
 
       if (!mounted) return;
       setState(() {
@@ -346,9 +348,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     await _stopAll();
 
     if (!mounted) return;
-    setState(() {
-      mode = ControlMode.automatic;
-    });
+    setState(() => mode = ControlMode.automatic);
     await _fetchStatus();
   }
 
@@ -382,8 +382,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     await _fetchStatus();
   }
 
-  // The Arduino keeps the original raw manual endpoints. The Sumobot chassis
-  // is physically reversed, so the Flutter logical controls stay inverted.
+  // Flutter logical controls stay inverted because the attack side is the
+  // original rear of the RC chassis.
   String? _driveEndpoint(DriveDirection direction) {
     return switch (direction) {
       DriveDirection.forward => '/b',
@@ -481,9 +481,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       steeringDirection = SteeringDirection.center;
     });
 
-    if (isConnected && wasMoving) {
-      unawaited(_queueCommand('/s'));
-    }
+    if (isConnected && wasMoving) unawaited(_queueCommand('/s'));
   }
 
   Future<void> _sendJoystickTransition({
@@ -845,12 +843,12 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
       decoration: BoxDecoration(
-        color: _anyEdgeDetected
+        color: _anyDangerNow
             ? Colors.redAccent.withValues(alpha: 0.10)
             : const Color(0xFF14171C),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: _anyEdgeDetected
+          color: _anyDangerNow
               ? Colors.redAccent.withValues(alpha: 0.45)
               : Colors.white.withValues(alpha: 0.055),
         ),
@@ -860,7 +858,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           Icon(
             Icons.border_outer_rounded,
             size: 19,
-            color: _anyEdgeDetected ? Colors.redAccent : Colors.white38,
+            color: _anyDangerNow ? Colors.redAccent : Colors.white38,
           ),
           const SizedBox(width: 9),
           const Text(
@@ -868,29 +866,18 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
             style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
           ),
           const SizedBox(width: 12),
-          Expanded(
-            child: _miniEdgeStatus(
-              'FRONT',
-              tcrtFront,
-              frontEdgeDetected,
-            ),
-          ),
+          Expanded(child: _miniEdgeStatus('FRONT', tcrtFront)),
           const SizedBox(width: 8),
-          Expanded(
-            child: _miniEdgeStatus(
-              'BACK',
-              tcrtBack,
-              backEdgeDetected,
-            ),
-          ),
+          Expanded(child: _miniEdgeStatus('BACK', tcrtBack)),
         ],
       ),
     );
   }
 
-  Widget _miniEdgeStatus(String label, int value, bool detected) {
+  Widget _miniEdgeStatus(String label, int value) {
     final known = value >= 0;
-    final color = detected
+    final danger = known && value >= _tcrtDangerThreshold;
+    final color = danger
         ? Colors.redAccent
         : known
             ? Colors.greenAccent
@@ -914,7 +901,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         ),
         const SizedBox(width: 5),
         Text(
-          detected ? 'DANGER' : (known ? 'SAFE' : 'WAIT'),
+          danger ? 'DANGER' : (known ? 'SAFE' : 'WAIT'),
           style: TextStyle(
             color: color,
             fontSize: 9,
@@ -947,8 +934,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           Expanded(
             child: Text(
               stopped
-                  ? 'MANUAL SAFETY STOP: a TCRT read BLACK / DANGER (ADC ≥ $_tcrtDangerThreshold).'
-                  : 'Manual safety active: either TCRT at ADC ≥ $_tcrtDangerThreshold stops both motors.',
+                  ? 'MANUAL SAFETY STOP: a TCRT reached BLACK / DANGER (ADC ≥ $_tcrtDangerThreshold).'
+                  : 'Manual safety active: either TCRT at ADC ≥ $_tcrtDangerThreshold immediately stops both motors.',
               style: TextStyle(
                 color: color,
                 fontSize: 10.5,
@@ -991,10 +978,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                     _manualSafetyStop
                         ? 'ESP32 stopped drive and steering'
                         : 'Drive: $driveText • Steering: $steeringText',
-                    style: const TextStyle(
-                      color: Colors.white38,
-                      fontSize: 10,
-                    ),
+                    style: const TextStyle(color: Colors.white38, fontSize: 10),
                   ),
                 ],
               ),
@@ -1106,7 +1090,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   _sectionHeader(
                     Icons.auto_mode_rounded,
                     'Autonomous Control',
-                    '30% search • center confirm • 100% attack • edge priority',
+                    '30% search • 100% attack • retreat + clockwise recovery',
                   ),
                   const SizedBox(height: 16),
                   Container(
@@ -1137,6 +1121,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                         const SizedBox(height: 4),
                         Text(
                           'Action: $autoAction',
+                          textAlign: TextAlign.center,
                           style: const TextStyle(
                             color: Colors.white54,
                             fontSize: 11,
@@ -1145,15 +1130,18 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                         ),
                         const SizedBox(height: 3),
                         Text(
-                          _anyEdgeDetected
-                              ? 'BLACK / DANGER SURFACE DETECTED'
-                              : 'Opponent located: ${opponentLocated ? 'YES' : 'NO'}',
+                          _edgeRecoveryActive
+                              ? _edgeRecoveryShortText()
+                              : _anyDangerNow
+                                  ? 'BLACK / DANGER SURFACE DETECTED'
+                                  : 'Opponent located: ${opponentLocated ? 'YES' : 'NO'}',
+                          textAlign: TextAlign.center,
                           style: TextStyle(
-                            color: _anyEdgeDetected
-                                ? Colors.redAccent
+                            color: _edgeRecoveryActive || _anyDangerNow
+                                ? Colors.purpleAccent
                                 : Colors.white54,
                             fontSize: 11,
-                            fontWeight: _anyEdgeDetected
+                            fontWeight: _edgeRecoveryActive || _anyDangerNow
                                 ? FontWeight.bold
                                 : FontWeight.normal,
                           ),
@@ -1221,26 +1209,14 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   _sectionHeader(
                     Icons.border_outer_rounded,
                     'TCRT5000L Surface Sensors',
-                    'BLACK / DANGER ≥ $_tcrtDangerThreshold ADC • WHITE / SAFE < $_tcrtDangerThreshold',
+                    'BLACK / DANGER ≥ $_tcrtDangerThreshold • WHITE / SAFE < $_tcrtDangerThreshold',
                   ),
                   const SizedBox(height: 18),
                   Row(
                     children: [
-                      Expanded(
-                        child: _edgeSensorTile(
-                          'FRONT',
-                          tcrtFront,
-                          frontEdgeDetected,
-                        ),
-                      ),
+                      Expanded(child: _edgeSensorTile('FRONT', tcrtFront, frontEdgeConfirmed)),
                       const SizedBox(width: 10),
-                      Expanded(
-                        child: _edgeSensorTile(
-                          'BACK',
-                          tcrtBack,
-                          backEdgeDetected,
-                        ),
-                      ),
+                      Expanded(child: _edgeSensorTile('BACK', tcrtBack, backEdgeConfirmed)),
                     ],
                   ),
                   const SizedBox(height: 12),
@@ -1248,17 +1224,17 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                     width: double.infinity,
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: (_anyEdgeDetected
-                              ? Colors.redAccent
+                      color: (_edgeRecoveryActive || _anyDangerNow
+                              ? Colors.purpleAccent
                               : Colors.greenAccent)
                           .withValues(alpha: 0.08),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Text(
-                      _edgeStatusText(),
+                      _surfaceStatusText(),
                       style: TextStyle(
-                        color: _anyEdgeDetected
-                            ? Colors.redAccent
+                        color: _edgeRecoveryActive || _anyDangerNow
+                            ? Colors.purpleAccent
                             : Colors.greenAccent,
                         fontSize: 11,
                         fontWeight: FontWeight.w600,
@@ -1274,23 +1250,59 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _sectionHeader(
-                    Icons.account_tree_rounded,
-                    'Current Autonomous Logic',
-                    'Matches the uploaded 1-VL53 + 2-TCRT firmware',
+                    Icons.rotate_right_rounded,
+                    'Clockwise Edge Recovery',
+                    'Non-blocking millis() recovery sequence used by the ESP32',
                   ),
                   const SizedBox(height: 14),
-                  _logicRow('Both danger', 'STOP while both TCRTs remain dangerous'),
-                  _logicRow('Front danger', 'Reverse at full drive to escape'),
-                  _logicRow('Back danger', 'Drive forward at full drive to escape'),
+                  _logicRow(
+                    '1. Retreat',
+                    'Move straight away at PWM $_edgeRetreatPwm (100%) for at least ${_edgeMinRetreatMs}ms; max ${_edgeMaxRetreatMs}ms.',
+                  ),
+                  _logicRow(
+                    '2. Turn CW',
+                    'Forward + RIGHT at PWM $_edgeTurnPwm (~$_edgeTurnPercent%) for ${_edgeTurnMs}ms.',
+                  ),
+                  _logicRow(
+                    '3. Verify',
+                    'Stop for ${_edgeSettleMs}ms and require both TCRTs to be below $_tcrtDangerThreshold.',
+                  ),
+                  _logicRow(
+                    '4. Resume',
+                    'Return to SEARCH only after the surface is safe.',
+                  ),
+                  const SizedBox(height: 8),
+                  _recoveryPhaseBox(),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            _card(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _sectionHeader(
+                    Icons.account_tree_rounded,
+                    'Current Autonomous Logic',
+                    'Matches the latest 1-VL53 + 2-TCRT firmware',
+                  ),
+                  const SizedBox(height: 14),
+                  _logicRow(
+                    'Any BLACK',
+                    'EDGE_ESCAPE has priority over search, confirm, and attack.',
+                  ),
                   _logicRow(
                     'No target',
-                    'Continuous $_searchDrivePercent% search; swap LEFT/RIGHT every ${_searchSweepMs}ms',
+                    'Continuous $_searchDrivePercent% search; hold LEFT/RIGHT for ${_searchSweepMs}ms each.',
                   ),
                   _logicRow(
                     'Center target',
-                    'Center steering for ${_alignConfirmMs}ms, then ATTACK',
+                    'Center steering for ${_alignConfirmMs}ms at full drive, then ATTACK.',
                   ),
-                  _logicRow('Attack', 'Straight drive at $_attackDrivePercent% power'),
+                  _logicRow(
+                    'Attack',
+                    'Drive straight at $_attackDrivePercent% while the target stays detected.',
+                  ),
                   const Divider(height: 24),
                   const Text(
                     'Manual Safety',
@@ -1298,8 +1310,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                   ),
                   const SizedBox(height: 8),
                   _logicRow(
-                    'Any danger',
-                    'ESP32 immediately stops drive + steering in MANUAL mode',
+                    'Any BLACK',
+                    'Immediately stop drive and steering in MANUAL mode.',
                   ),
                   const Divider(height: 24),
                   const Text(
@@ -1307,8 +1319,8 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
                     style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
                   ),
                   const SizedBox(height: 8),
-                  _endpointRow('/status', 'Live state, sensors, action and VL53 health'),
-                  _endpointRow('/i2c', 'Check the center VL53L0X at 0x29'),
+                  _endpointRow('/status', 'Live mode, state, sensors, action, and health'),
+                  _endpointRow('/i2c', 'Check center VL53L0X at address 0x29'),
                   _endpointRow('/auto/start', 'Start autonomous state machine'),
                   _endpointRow('/auto/stop', 'Stop auto and return to manual'),
                   _endpointRow('/f /b /l /r /s', 'Manual single-axis controls'),
@@ -1403,9 +1415,10 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     );
   }
 
-  Widget _edgeSensorTile(String label, int value, bool detected) {
+  Widget _edgeSensorTile(String label, int value, bool confirmed) {
     final known = value >= 0;
-    final color = detected
+    final danger = known && value >= _tcrtDangerThreshold;
+    final color = danger
         ? Colors.redAccent
         : known
             ? Colors.greenAccent
@@ -1439,7 +1452,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
           ),
           const SizedBox(height: 7),
           Text(
-            detected ? 'BLACK / DANGER' : (known ? 'WHITE / SAFE' : 'WAITING'),
+            danger ? 'BLACK / DANGER' : (known ? 'WHITE / SAFE' : 'WAITING'),
             textAlign: TextAlign.center,
             style: TextStyle(
               color: color,
@@ -1447,22 +1460,117 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
               fontWeight: FontWeight.bold,
             ),
           ),
+          if (known) ...[
+            const SizedBox(height: 4),
+            Text(
+              confirmed ? 'debounced: danger' : 'debounced: safe',
+              style: const TextStyle(color: Colors.white30, fontSize: 8),
+            ),
+          ],
         ],
       ),
     );
   }
 
-  String _edgeStatusText() {
-    if (frontEdgeDetected && backEdgeDetected) {
-      return 'BOTH DANGER: ESP32 stops the robot until the condition clears.';
+  String _surfaceStatusText() {
+    if (_edgeRecoveryActive) return _edgeRecoveryDetailText();
+
+    if (_frontDangerNow && _backDangerNow) {
+      return 'BOTH TCRTs are BLACK / DANGER. The ESP32 stops instead of guessing a retreat direction.';
     }
-    if (frontEdgeDetected) {
-      return 'FRONT DANGER: ESP32 reverses at full drive to leave the black surface.';
+    if (_frontDangerNow) {
+      return 'FRONT is BLACK / DANGER. Autonomous recovery retreats straight backward first.';
     }
-    if (backEdgeDetected) {
-      return 'BACK DANGER: ESP32 drives forward at full drive to leave the black surface.';
+    if (_backDangerNow) {
+      return 'BACK is BLACK / DANGER. Autonomous recovery moves straight forward first.';
     }
-    return 'SURFACE STATUS: WHITE / SAFE. Normal search / confirm / attack logic may continue.';
+    return 'SURFACE STATUS: both TCRT readings are below $_tcrtDangerThreshold (WHITE / SAFE).';
+  }
+
+  String _edgeRecoveryShortText() {
+    switch (autoAction) {
+      case 'EDGE_FRONT_RETREAT':
+        return 'RETREATING FROM FRONT DANGER';
+      case 'EDGE_BACK_RETREAT':
+        return 'RETREATING FROM BACK DANGER';
+      case 'EDGE_TURN_CLOCKWISE':
+        return 'CLOCKWISE RE-ENTRY TURN';
+      case 'EDGE_VERIFY_SAFE':
+        return 'VERIFYING SAFE SURFACE';
+      case 'EDGE_BOTH_STOP':
+        return 'BOTH TCRTs DANGEROUS — STOPPED';
+      case 'EDGE_FAILSAFE_STOP':
+        return 'EDGE RECOVERY FAILSAFE STOP';
+      default:
+        return 'EDGE RECOVERY ACTIVE';
+    }
+  }
+
+  String _edgeRecoveryDetailText() {
+    switch (autoAction) {
+      case 'EDGE_FRONT_RETREAT':
+        return 'Front triggered recovery: reversing straight at full PWM until safe after at least ${_edgeMinRetreatMs}ms, with a ${_edgeMaxRetreatMs}ms maximum.';
+      case 'EDGE_BACK_RETREAT':
+        return 'Back triggered recovery: moving forward straight at full PWM until safe after at least ${_edgeMinRetreatMs}ms, with a ${_edgeMaxRetreatMs}ms maximum.';
+      case 'EDGE_TURN_CLOCKWISE':
+        return 'Safe enough to re-enter: moving forward + RIGHT at PWM $_edgeTurnPwm (~$_edgeTurnPercent%) for ${_edgeTurnMs}ms.';
+      case 'EDGE_VERIFY_SAFE':
+        return 'Recovery turn finished: motors stopped for ${_edgeSettleMs}ms while both TCRTs are checked for WHITE / SAFE.';
+      case 'EDGE_BOTH_STOP':
+        return 'Both TCRTs report danger. Motors stay stopped until a reliable retreat direction becomes available.';
+      case 'EDGE_FAILSAFE_STOP':
+        return 'Unexpected recovery phase: ESP32 failsafe stopped the motors before re-checking the surface.';
+      default:
+        return 'The ESP32 is completing its non-blocking retreat, clockwise turn, and safety verification sequence.';
+    }
+  }
+
+  Widget _recoveryPhaseBox() {
+    final active = _edgeRecoveryActive;
+    final color = active ? Colors.purpleAccent : Colors.white38;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: active ? 0.10 : 0.04),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            active ? Icons.rotate_right_rounded : Icons.check_circle_outline,
+            size: 20,
+            color: color,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  active ? _edgeRecoveryShortText() : 'RECOVERY IDLE',
+                  style: TextStyle(
+                    color: color,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 11,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  active
+                      ? _edgeRecoveryDetailText()
+                      : 'No edge recovery is currently running.',
+                  style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _decisionBox() {
@@ -1470,25 +1578,29 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
     late final String detail;
     late final Color color;
 
-    if (frontEdgeDetected && backEdgeDetected) {
+    if (_edgeRecoveryActive) {
+      title = _edgeRecoveryShortText();
+      detail = _edgeRecoveryDetailText();
+      color = Colors.purpleAccent;
+    } else if (_frontDangerNow && _backDangerNow) {
       title = 'DANGER STOP';
-      detail = 'Both TCRT sensors report BLACK / DANGER. Motors stop.';
+      detail = 'Both TCRT values are at or above $_tcrtDangerThreshold.';
       color = Colors.redAccent;
-    } else if (frontEdgeDetected) {
-      title = 'ESCAPE FRONT';
-      detail = 'Front TCRT reports BLACK / DANGER. Robot reverses away.';
-      color = Colors.purpleAccent;
-    } else if (backEdgeDetected) {
-      title = 'ESCAPE BACK';
-      detail = 'Back TCRT reports BLACK / DANGER. Robot drives forward away.';
-      color = Colors.purpleAccent;
+    } else if (_frontDangerNow) {
+      title = 'FRONT DANGER';
+      detail = 'Front TCRT reached BLACK / DANGER. Edge recovery has priority.';
+      color = Colors.redAccent;
+    } else if (_backDangerNow) {
+      title = 'BACK DANGER';
+      detail = 'Back TCRT reached BLACK / DANGER. Edge recovery has priority.';
+      color = Colors.redAccent;
     } else if (tofDetected && robotState == 'ATTACKING') {
       title = 'ATTACK';
       detail = 'Centered target remains within $_enemyDistanceMm mm; drive is $_attackDrivePercent%.';
       color = Colors.redAccent;
     } else if (tofDetected && robotState == 'ALIGNING') {
       title = 'CENTER CONFIRM';
-      detail = 'Steering centers for ${_alignConfirmMs}ms before full-power attack.';
+      detail = 'Steering is released for ${_alignConfirmMs}ms while driving at full power before attack.';
       color = Colors.lightBlueAccent;
     } else if (tofDetected) {
       title = 'TARGET DETECTED';
@@ -1496,7 +1608,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
       color = Colors.greenAccent;
     } else {
       title = 'SEARCHING';
-      detail = 'No target within $_enemyDistanceMm mm; driving at $_searchDrivePercent% while sweeping left/right.';
+      detail = 'No target within $_enemyDistanceMm mm; driving at $_searchDrivePercent% and holding each steering direction for ${_searchSweepMs}ms.';
       color = Colors.amberAccent;
     }
 
@@ -1531,7 +1643,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 92,
+            width: 94,
             child: Text(
               condition,
               style: const TextStyle(
