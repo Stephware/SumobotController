@@ -48,7 +48,7 @@ class _SumobotControllerPageState extends State<SumobotControllerPage> {
   static const int _enemyDistanceMm = 200;
   static const int _noDetectionMm = 8190;
   static const int _unknownAdc = -1;
-  static const int _tcrtDangerThreshold = 3000;
+  static const int _tcrtDangerThreshold = 2500;
 
   static const int _searchDrivePercent = 30;
   static const int _searchSweepMs = 1600;
